@@ -1,0 +1,24 @@
+version: '3.8'
+services:
+  app:
+    build: 
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - .:/workspace:cached
+    command: sleep infinity
+    depends_on:
+      - db
+    
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: luffy_db
+      POSTGRES_USER: luffy_admin
+      POSTGRES_PASSWORD: changeme
+
+volumes:
+  postgres-data:
