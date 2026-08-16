@@ -4,11 +4,16 @@
     "service": "app",
     "workspaceFolder": "/workspace",
     "forwardPorts": [8000, 5432],
+    "remoteUser": "vscode",
     "features": {
         "ghcr.io/devcontainers/features/python:1": {
             "installTools": true,
             "version": "3.11"
-        }
+        },
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+    },
+    "containerEnv": {
+        "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
     },
     "customizations": {
         "vscode": {
@@ -21,4 +26,5 @@
         }
     },
     "postCreateCommand": "pip install -r requirements.txt"
-}
+},
+"Add Claude Code"
