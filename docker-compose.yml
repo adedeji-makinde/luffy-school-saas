@@ -6,6 +6,7 @@ services:
       dockerfile: .devcontainer/Dockerfile
     volumes:
       - .:/workspace:cached
+      - claude-config:/home/vscode/.claude
     command: sleep infinity
     depends_on:
       - db
@@ -22,3 +23,4 @@ services:
 
 volumes:
   postgres-data:
+  claude-config:
