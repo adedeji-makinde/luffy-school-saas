@@ -62,7 +62,34 @@ A parent's reach is derived, never stored twice:
 - `User.children()` returns every child across every school in one query;
   `services.parent_dashboard()` groups them by school for the portal view.
 
+## Who may grant memberships
+
+A school administrator's authority stops at their own school. An admin at St Mary's
+cannot enrol a child, hire a teacher or link a parent at Grace Academy; only
+`is_platform_staff` acts across schools. `MEMBERSHIP_GRANTING_ROLES` holds the roles
+that may grant — currently `admin` alone. Principals are deliberately excluded; add
+them to that frozenset if the policy changes.
+
+The functions in `services.py` come in two layers, and the distinction matters:
+
+- **Primitives** — `grant_membership`, `enroll_student`, `link_guardian`,
+  `unlink_guardian`, `transfer_student`. They keep the data consistent but ask nothing
+  about the caller, which is what lets `link_guardian` grant a `PARENT` membership by
+  itself. Use these for imports, fixtures and internal calls.
+- **Actor-checked** — the same names with an `_as` suffix, taking the acting user
+  first. They call `can_grant_memberships(actor, school)` and raise `NotPermitted`.
+  **Anything driven by a request goes through these.**
+
+`transfer_student_as` needs authority at *both* schools, since a transfer ends a
+membership at one and opens one at the other. In practice that means platform staff, or
+an admin who holds a membership at both.
+
 ## Students
+
+Students do not see siblings — that is a parent-only view. It follows from the model
+rather than needing a rule: `User.children()` returns children of a *guardian*, and a
+student is never a guardian, so a student sees only their own membership. Tests pin
+this so it does not become true by accident and then quietly stop being true.
 
 A student has exactly one school, enforced in Postgres as a partial unique index:
 

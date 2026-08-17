@@ -13,6 +13,7 @@ from django.db import transaction
 
 from .models import (
     LIVE_STATUSES,
+    MEMBERSHIP_GRANTING_ROLES,
     Guardianship,
     Membership,
     MembershipStatus,
@@ -32,6 +33,29 @@ class AlreadyEnrolled(MembershipError):
 
 class NotAStudent(MembershipError):
     pass
+
+
+class NotPermitted(MembershipError):
+    """The actor has no authority to grant memberships at that school."""
+
+
+def can_grant_memberships(actor, school) -> bool:
+    """May `actor` hand out memberships at `school`?
+
+    A school administrator's authority stops at their own school — an admin at
+    St Mary's cannot enrol anyone at Grace Academy. Only platform staff act
+    across schools.
+    """
+    if getattr(actor, "is_platform_staff", False):
+        return True
+    return actor.memberships.live().filter(
+        school=school, role__in=MEMBERSHIP_GRANTING_ROLES
+    ).exists()
+
+
+def _require_grant_authority(actor, school):
+    if not can_grant_memberships(actor, school):
+        raise NotPermitted(f"{actor} cannot grant memberships at {school}.")
 
 
 @transaction.atomic
@@ -181,6 +205,53 @@ def transfer_student(student, to_school, *, reference=""):
         unlink_guardian(link.guardian, student)
 
     return new_membership
+
+
+# ---------------------------------------------------------------------------
+# Actor-checked entry points.
+#
+# The functions above are primitives: they keep the data consistent but ask no
+# questions about who is calling, which is what lets link_guardian() grant a
+# PARENT membership on its own. Anything driven by a request should come
+# through here instead, so a school administrator's reach stays inside their
+# own school.
+# ---------------------------------------------------------------------------
+
+
+@transaction.atomic
+def grant_membership_as(actor, user, school, role, **kwargs):
+    _require_grant_authority(actor, school)
+    return grant_membership(user, school, role, **kwargs)
+
+
+@transaction.atomic
+def enroll_student_as(actor, user, school, **kwargs):
+    _require_grant_authority(actor, school)
+    return enroll_student(user, school, **kwargs)
+
+
+@transaction.atomic
+def link_guardian_as(actor, guardian, student, **kwargs):
+    # Authority is needed at the child's school, because linking grants the
+    # parent a membership there.
+    _require_grant_authority(actor, student.school)
+    return link_guardian(guardian, student, **kwargs)
+
+
+@transaction.atomic
+def unlink_guardian_as(actor, guardian, student):
+    _require_grant_authority(actor, student.school)
+    return unlink_guardian(guardian, student)
+
+
+@transaction.atomic
+def transfer_student_as(actor, student, to_school, **kwargs):
+    # A transfer ends a membership at one school and opens one at another, so
+    # it needs authority at both ends — in practice platform staff, or an admin
+    # who happens to hold a membership at both schools.
+    _require_grant_authority(actor, student.school)
+    _require_grant_authority(actor, to_school)
+    return transfer_student(student, to_school, **kwargs)
 
 
 def parent_dashboard(guardian):

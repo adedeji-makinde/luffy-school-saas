@@ -359,6 +359,104 @@ class GuardianshipRulesTests(TestCase):
         self.assertEqual(self.parent.children().count(), 1)
 
 
+class GrantAuthorityStopsAtOwnSchoolTests(TestCase):
+    def setUp(self):
+        self.stmarys = make_school("St Mary's", "st-marys", "st_marys")
+        self.grace = make_school("Grace Academy", "grace", "grace")
+
+        self.admin = make_user("admin@stmarys.ng", "Office Admin")
+        services.grant_membership(self.admin, self.stmarys, Role.ADMIN)
+        self.newcomer = make_user("STM/9", "New Child")
+
+    def test_an_admin_grants_memberships_at_their_own_school(self):
+        self.assertTrue(services.can_grant_memberships(self.admin, self.stmarys))
+        membership = services.enroll_student_as(self.admin, self.newcomer, self.stmarys)
+        self.assertEqual(membership.school, self.stmarys)
+
+    def test_an_admin_cannot_reach_another_school(self):
+        self.assertFalse(services.can_grant_memberships(self.admin, self.grace))
+        with self.assertRaises(services.NotPermitted):
+            services.enroll_student_as(self.admin, self.newcomer, self.grace)
+        with self.assertRaises(services.NotPermitted):
+            services.grant_membership_as(
+                self.admin, self.newcomer, self.grace, Role.TEACHER
+            )
+        self.assertEqual(Membership.objects.filter(school=self.grace).count(), 0)
+
+    def test_platform_staff_reach_every_school(self):
+        operator = make_user("ops", "Ops Person", is_platform_staff=True)
+        self.assertTrue(services.can_grant_memberships(operator, self.grace))
+        services.enroll_student_as(operator, self.newcomer, self.grace)
+        self.assertEqual(self.newcomer.student_membership().school, self.grace)
+
+    def test_other_roles_cannot_grant_even_at_their_own_school(self):
+        for role in (Role.PRINCIPAL, Role.TEACHER, Role.BURSAR, Role.PARENT):
+            with self.subTest(role=role.value):
+                person = make_user(f"person-{role.value}", f"Person {role.value}")
+                services.grant_membership(person, self.stmarys, role)
+                self.assertFalse(services.can_grant_memberships(person, self.stmarys))
+                with self.assertRaises(services.NotPermitted):
+                    services.grant_membership_as(
+                        person, self.newcomer, self.stmarys, Role.STUDENT
+                    )
+
+    def test_linking_a_guardian_needs_authority_at_the_childs_school(self):
+        child = services.enroll_student(make_user("GA/1", "Grace Child"), self.grace)
+        parent = make_user("08031234567", "Bisi Ade", phone="08031234567")
+
+        with self.assertRaises(services.NotPermitted):
+            services.link_guardian_as(self.admin, parent, child)
+        self.assertEqual(parent.children().count(), 0)
+
+    def test_a_transfer_needs_authority_at_both_ends(self):
+        child = services.enroll_student(make_user("STM/1", "Ada Ade"), self.stmarys)
+
+        # Admin holds St Mary's only, so a move to Grace is refused.
+        with self.assertRaises(services.NotPermitted):
+            services.transfer_student_as(self.admin, child, self.grace)
+        child.refresh_from_db()
+        self.assertEqual(child.status, MembershipStatus.ACTIVE)
+
+        services.grant_membership(self.admin, self.grace, Role.ADMIN)
+        moved = services.transfer_student_as(self.admin, child, self.grace)
+        self.assertEqual(moved.school, self.grace)
+
+    def test_a_suspended_admin_loses_the_authority(self):
+        Membership.objects.filter(user=self.admin, school=self.stmarys).update(
+            status=MembershipStatus.ENDED
+        )
+        self.assertFalse(services.can_grant_memberships(self.admin, self.stmarys))
+
+
+class StudentsDoNotSeeSiblingsTests(TestCase):
+    """Sibling visibility is a parent-only view, for now."""
+
+    def setUp(self):
+        self.school = make_school("St Mary's", "st-marys", "st_marys")
+        self.parent = make_user("08031234567", "Bisi Ade", phone="08031234567")
+        self.ada = services.enroll_student(make_user("STM/1", "Ada Ade"), self.school)
+        self.tunde = services.enroll_student(make_user("STM/2", "Tunde Ade"), self.school)
+        for child in (self.ada, self.tunde):
+            services.link_guardian(self.parent, child)
+
+    def test_a_student_sees_no_siblings_even_though_the_parent_does(self):
+        self.assertEqual(self.parent.children().count(), 2)
+
+        self.assertEqual(self.ada.user.children().count(), 0)
+        self.assertEqual(services.parent_dashboard(self.ada.user), [])
+
+    def test_a_student_sees_only_their_own_membership(self):
+        self.assertEqual(self.ada.user.student_membership(), self.ada)
+        self.assertEqual(list(self.ada.user.live_memberships()), [self.ada])
+        self.assertEqual(self.ada.user.roles_at(self.school), {Role.STUDENT.value})
+
+    def test_a_student_is_never_a_guardian(self):
+        self.assertEqual(
+            Guardianship.objects.filter(guardian=self.ada.user).count(), 0
+        )
+        self.assertNotIn(self.ada.user, self.tunde.guardians())
+
+
 class SchoolAccessMiddlewareTests(TestCase):
     def setUp(self):
         self.stmarys = make_school("St Mary's", "st-marys", "st_marys")

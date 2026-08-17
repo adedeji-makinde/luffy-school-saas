@@ -43,6 +43,10 @@ STAFF_ROLES = frozenset(
 FAMILY_ROLES = frozenset({Role.PARENT.value, Role.STUDENT.value})
 # Every role except STUDENT may be held at several schools at once.
 SINGLE_SCHOOL_ROLES = frozenset({Role.STUDENT.value})
+# Roles that may hand out memberships — at their own school only, never
+# platform-wide. Principals are deliberately not included; add them here if
+# that changes. Cross-school authority belongs to User.is_platform_staff.
+MEMBERSHIP_GRANTING_ROLES = frozenset({Role.ADMIN.value})
 
 
 def is_staff_role(role) -> bool:
