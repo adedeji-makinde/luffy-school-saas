@@ -4,12 +4,18 @@ from django_tenants.utils import get_public_schema_name
 
 
 class SchoolAccessMiddleware:
-    """Keeps a signed-in person to the schools they actually belong to.
+    """Keeps a signed-in person to the schools they may actually act at.
 
-    On a school's own host, an authenticated user needs a live Membership there.
-    On the public portal host they do not: that is where a parent sees children
-    from several schools at once, and where a login with no membership anywhere
-    still has to be able to sign in.
+    On a school's own host, an authenticated user needs an **active** Membership
+    there. Invited and suspended people are refused: their relationship exists,
+    but it does not grant access. That rule is not spelled out below — it lives
+    one step away in `User.roles_at()`, which is scoped to ACCESS_STATUSES.
+    Deliberately not `.live()`, which is the wider set including invited and
+    suspended.
+
+    On the public portal host none of this applies: that is where a parent sees
+    children from several schools at once, and where a login with no membership
+    anywhere still has to be able to sign in.
 
     Sets `request.school` (None on the portal) and `request.school_roles`.
     """
