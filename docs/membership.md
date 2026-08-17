@@ -163,3 +163,38 @@ optional and unique when present, stored as `NULL` rather than `""` so the uniqu
 indexes don't collide. Students get a school-issued handle (`STM/2026/0042`) because
 many have no email address; parents commonly use the phone number the school has on
 file.
+
+## Open items
+
+Both deliberately deferred, not overlooked. Neither is started.
+
+**1. Transfers need a handshake.** `transfer_student_as()` requires authority at both the
+old and the new school. Since an admin normally holds authority at one school only, that
+means **an ordinary school admin can never transfer a student** — in practice every
+transfer routes through platform staff, which does not scale.
+
+The agreed direction is to stop treating it as one operation and split it into two
+one-sided acts: `release_student_as(actor, student)` (old school ends the membership,
+authority at the old school only) followed by the existing `enroll_student_as()` (new
+school admits). Neither school ever writes at the other, and the partial index already
+allows it — once the old row is `ended`, the slot is free. `Membership.end()` and
+`enroll_student_as()` already exist, so this is a small change with no migration.
+
+Two costs to handle: guardians must be re-linked by the receiving school, and there is a
+window between release and admission where the child belongs to no school, so
+`student_membership()` returns `None`. A `TransferRequest` handshake — either side
+initiates, the other accepts, then `transfer_student()` runs — would close the window and
+record who agreed, which matters the first time a transfer is disputed.
+
+Rejected on principle: destination-only authority. It would let a receiving school
+unilaterally end a membership at a school it has no relationship with, which is exactly
+the cross-school write this model exists to prevent.
+
+**2. No invitation flow.** Nothing sets `invited` except an explicit `status=` argument —
+no tokens, no email, no acceptance step. When it is built, remember that identity is
+global, so the two states are orthogonal: whether the *person* has a usable credential
+(`User`-level) and whether *this school's* relationship has been accepted
+(`Membership`-level). A parent invited to a second school may already have a full account
+with a password, and a flow assuming "invite ⇒ create account" would break that case —
+which is the case this model exists to serve. `create_user(username, None)` yields an
+unusable password and cannot authenticate, which is the natural placeholder.
