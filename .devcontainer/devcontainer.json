@@ -10,6 +10,7 @@
             "installTools": true,
             "version": "3.11"
         },
+        "ghcr.io/devcontainers/features/node:1": {},
         "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
     },
     "containerEnv": {
@@ -25,6 +26,5 @@
             ]
         }
     },
-    "postCreateCommand": "pip install -r requirements.txt"
-},
-"Add Claude Code"
+    "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude && pip install -r requirements.txt"
+}
