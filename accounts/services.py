@@ -45,10 +45,13 @@ def can_grant_memberships(actor, school) -> bool:
     A school administrator's authority stops at their own school — an admin at
     St Mary's cannot enrol anyone at Grace Academy. Only platform staff act
     across schools.
+
+    Access-scoped: an admin who is merely invited, or who has been suspended,
+    grants nothing.
     """
     if getattr(actor, "is_platform_staff", False):
         return True
-    return actor.memberships.live().filter(
+    return actor.memberships.with_access().filter(
         school=school, role__in=MEMBERSHIP_GRANTING_ROLES
     ).exists()
 

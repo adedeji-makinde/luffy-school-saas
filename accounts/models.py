@@ -64,11 +64,21 @@ class MembershipStatus(models.TextChoices):
     ENDED = "ended", "Ended"
 
 
-#: Statuses that still tie a person to a school. `ENDED` is history: a
-#: graduated or transferred student keeps the row but frees the constraint.
+#: Statuses that still tie a person to a school — everything but ended history.
+#: A graduated or transferred student keeps the row but frees the constraint.
+#: This is the "does the relationship exist?" predicate: it decides whether a
+#: student's single-school slot is occupied and whether a child shows up on
+#: their parent's dashboard.
 LIVE_STATUSES = frozenset(
     {MembershipStatus.INVITED.value, MembershipStatus.ACTIVE.value, MembershipStatus.SUSPENDED.value}
 )
+
+#: Statuses that let a person actually act at a school. Deliberately narrower:
+#: an invitation is an offer rather than access, and a suspension withdraws it.
+#: Both still occupy the relationship above — see LIVE_STATUSES. Keeping these
+#: two predicates apart is what lets a parent see an invited child before that
+#: child can sign in.
+ACCESS_STATUSES = frozenset({MembershipStatus.ACTIVE.value})
 
 
 class Relationship(models.TextChoices):
@@ -164,29 +174,44 @@ class User(AbstractBaseUser, PermissionsMixin):
     # -- access questions, all answerable without leaving the public schema --
 
     def live_memberships(self):
+        """Every relationship that still exists, invited and suspended included."""
         return self.memberships.live().select_related("school")
 
     def schools(self):
-        """Every school this login can reach, in any capacity."""
+        """Every school this login can act at."""
         from schools.models import School
 
         return School.objects.filter(
-            memberships__user=self, memberships__status__in=LIVE_STATUSES
+            memberships__user=self, memberships__status__in=ACCESS_STATUSES
         ).distinct()
 
     def roles_at(self, school) -> set:
+        """Roles this login may currently exercise at `school`.
+
+        Access-scoped, so an invited or suspended person has no roles here even
+        though the membership exists. Authorisation reads this.
+        """
         return set(
-            self.memberships.live().filter(school=school).values_list("role", flat=True)
+            self.memberships.with_access()
+            .filter(school=school)
+            .values_list("role", flat=True)
         )
 
     def has_access_to(self, school) -> bool:
-        return self.is_platform_staff or self.memberships.live().filter(school=school).exists()
+        return (
+            self.is_platform_staff
+            or self.memberships.with_access().filter(school=school).exists()
+        )
 
     def children(self):
         """Every child this login guards, across every school.
 
         One query, no schema switching — this is what lets a parent with kids
         at two schools see all of them from one login.
+
+        Scoped to LIVE_STATUSES rather than ACCESS_STATUSES on purpose: a parent
+        should see an invited child on their dashboard before that child can
+        sign in themselves.
         """
         return (
             Membership.objects.filter(
@@ -197,17 +222,26 @@ class User(AbstractBaseUser, PermissionsMixin):
         )
 
     def student_membership(self):
-        """A student has exactly one school, so this is singular by design."""
+        """A student has exactly one school, so this is singular by design.
+
+        Relationship-scoped: an invited student already belongs to their school.
+        """
         return self.memberships.live().filter(role=Role.STUDENT).select_related("school").first()
 
 
 class MembershipQuerySet(models.QuerySet):
     def live(self):
-        """Memberships that still grant access."""
+        """Relationships that still exist — everything but ended history.
+
+        Includes invited and suspended people, who hold a place at the school
+        without being able to act there. For "may they do things?" use
+        `with_access()`.
+        """
         return self.filter(status__in=LIVE_STATUSES)
 
-    def active(self):
-        return self.filter(status=MembershipStatus.ACTIVE)
+    def with_access(self):
+        """Memberships that let the person act at the school. Active only."""
+        return self.filter(status__in=ACCESS_STATUSES)
 
     def staff(self):
         return self.filter(role__in=STAFF_ROLES)
@@ -234,8 +268,12 @@ class Membership(models.Model):
     """
 
     user = models.ForeignKey(User, related_name="memberships", on_delete=models.CASCADE)
+    # PROTECT, not CASCADE: these rows are the family history. Deleting a school
+    # must not quietly take enrolments and guardianships with it as a side
+    # effect. Ending a membership (status='ended') is the supported way to close
+    # a relationship, and ended rows still block the delete — that is the point.
     school = models.ForeignKey(
-        "schools.School", related_name="memberships", on_delete=models.CASCADE
+        "schools.School", related_name="memberships", on_delete=models.PROTECT
     )
     role = models.CharField(max_length=16, choices=Role)
     status = models.CharField(
@@ -287,7 +325,12 @@ class Membership(models.Model):
 
     @property
     def is_live(self) -> bool:
+        """The relationship exists — not necessarily usable. See grants_access."""
         return self.status in LIVE_STATUSES
+
+    @property
+    def grants_access(self) -> bool:
+        return self.status in ACCESS_STATUSES
 
     @property
     def is_staff_role(self) -> bool:
@@ -318,13 +361,16 @@ class Guardianship(models.Model):
     PARENT memberships.
     """
 
+    # Both sides PROTECT. These rows are family history, and no delete of a
+    # person or a membership should erase them as a side effect. Call
+    # services.unlink_guardian() first — it keeps both sides in step.
     guardian = models.ForeignKey(
-        User, related_name="guardianships", on_delete=models.CASCADE
+        User, related_name="guardianships", on_delete=models.PROTECT
     )
     student = models.ForeignKey(
         Membership,
         related_name="guardianships",
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         help_text="The child's STUDENT membership, which pins the school too.",
     )
     relationship = models.CharField(

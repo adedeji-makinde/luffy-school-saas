@@ -62,6 +62,33 @@ A parent's reach is derived, never stored twice:
 - `User.children()` returns every child across every school in one query;
   `services.parent_dashboard()` groups them by school for the portal view.
 
+## Two predicates, not one
+
+`Membership.status` answers two different questions, and conflating them causes bugs in
+both directions. Keep them apart:
+
+| Question | Predicate | Statuses | Used by |
+| --- | --- | --- | --- |
+| Does the relationship exist? | `LIVE_STATUSES` / `.live()` | invited, active, suspended | the one-school slot, `children()`, `student_membership()` |
+| May they act at the school? | `ACCESS_STATUSES` / `.with_access()` | active only | `has_access_to()`, `roles_at()`, the middleware, `can_grant_memberships()` |
+
+An invitation is an offer, not access, and a suspension withdraws access without
+dissolving the relationship. So an invited or suspended person cannot sign in, while
+still occupying their place — an invited student holds their single school slot and
+cannot be enrolled elsewhere.
+
+The important consequence runs the other way too: **`children()` is deliberately
+relationship-scoped**, so a parent sees an invited child on their dashboard before that
+child can sign in themselves. Do not "tidy" it to use `with_access()`.
+
+The database index is independent of both — it keys off `status <> 'ended'` directly, so
+changing either frozenset cannot weaken the one-school-per-student guarantee.
+
+There is no invitation *flow* yet: nothing sets `invited` except an explicit `status=`
+argument. No tokens, no email, no acceptance step. Note that a placeholder account made
+with `create_user(username, None)` has an unusable password and cannot authenticate,
+which is the natural building block when that flow gets built.
+
 ## Who may grant memberships
 
 A school administrator's authority stops at their own school. An admin at St Mary's
@@ -102,6 +129,31 @@ Two things follow. It is global rather than per-school — possible only because
 `status="ended"` releases it, so graduations and transfers keep their history instead
 of being deleted. Use `services.transfer_student()`, which ends the old membership,
 opens the new one, and carries the guardians across.
+
+## Deleting things
+
+`Membership.school` is **`PROTECT`**. Memberships and the guardianships hanging off
+them are the family history, and losing them as a side effect of deleting a school is
+the kind of bug that should be impossible rather than merely unlikely. Deleting a
+school with any membership — *including ended ones* — raises `ProtectedError`. Ended
+rows are the history, so they keep protecting the school; that is deliberate, not an
+oversight.
+
+Close a relationship with `membership.end()`, never `delete()`. `transfer_student()`
+already does this.
+
+**Both `Guardianship` foreign keys are `PROTECT` as well** — `guardian` and `student`.
+Nothing deletes a family link as a side effect: a guardian cannot be deleted while a
+link remains, and neither can a child, because their membership would cascade and the
+guardianship protects it. Call `services.unlink_guardian()` first; it keeps both sides
+in step. That leaves `Membership.user` as the one remaining cascade, which is a deletion
+*about* that person rather than a side effect — and it is still blocked while any
+guardianship references them.
+
+Worth knowing why both sides need protecting rather than just one: `Guardianship.guardian`
+points at the parent's **User**, not their PARENT membership. Before `PROTECT`, deleting a
+parent's membership left the link behind, so `children()` still listed the child while
+`has_access_to()` returned `False`.
 
 ## Signing in
 

@@ -5,6 +5,7 @@ import contextlib
 from django.contrib.auth import authenticate
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, connection, transaction
+from django.db.models import ProtectedError
 from django.test import RequestFactory, TestCase
 
 from accounts import services
@@ -421,11 +422,162 @@ class GrantAuthorityStopsAtOwnSchoolTests(TestCase):
         moved = services.transfer_student_as(self.admin, child, self.grace)
         self.assertEqual(moved.school, self.grace)
 
-    def test_a_suspended_admin_loses_the_authority(self):
-        Membership.objects.filter(user=self.admin, school=self.stmarys).update(
-            status=MembershipStatus.ENDED
+    def test_an_admin_who_is_not_active_loses_the_authority(self):
+        for status in (
+            MembershipStatus.INVITED,
+            MembershipStatus.SUSPENDED,
+            MembershipStatus.ENDED,
+        ):
+            with self.subTest(status=status.value):
+                Membership.objects.filter(
+                    user=self.admin, school=self.stmarys
+                ).update(status=status)
+                self.assertFalse(
+                    services.can_grant_memberships(self.admin, self.stmarys)
+                )
+
+
+class AccessRequiresActiveStatusTests(TestCase):
+    """Invited is an offer, not access. Suspended withdraws it.
+
+    Both still occupy the relationship, which is a different question from
+    whether the person can sign in.
+    """
+
+    def setUp(self):
+        self.school = make_school("St Mary's", "st-marys", "st_marys")
+        self.grace = make_school("Grace Academy", "grace", "grace")
+        self.factory = RequestFactory()
+        self.middleware = SchoolAccessMiddleware(lambda request: "ok")
+        self.teacher = make_user("ada@stmarys.ng", "Ada Obi", email="ada@stmarys.ng")
+
+    def set_status(self, user, status):
+        Membership.objects.filter(user=user, school=self.school).update(status=status)
+
+    def test_only_an_active_membership_grants_access(self):
+        services.grant_membership(self.teacher, self.school, Role.TEACHER)
+        expected = {
+            MembershipStatus.ACTIVE: True,
+            MembershipStatus.INVITED: False,
+            MembershipStatus.SUSPENDED: False,
+            MembershipStatus.ENDED: False,
+        }
+        for status, allowed in expected.items():
+            with self.subTest(status=status.value):
+                self.set_status(self.teacher, status)
+                self.assertEqual(self.teacher.has_access_to(self.school), allowed)
+                self.assertEqual(
+                    self.teacher.roles_at(self.school),
+                    {Role.TEACHER.value} if allowed else set(),
+                )
+                self.assertEqual(self.teacher.schools().count(), 1 if allowed else 0)
+
+    def test_an_invited_person_is_refused_at_the_school_door(self):
+        services.grant_membership(
+            self.teacher, self.school, Role.TEACHER, status=MembershipStatus.INVITED
         )
-        self.assertFalse(services.can_grant_memberships(self.admin, self.stmarys))
+        request = self.factory.get("/")
+        request.user = self.teacher
+        with on_host_of(self.school):
+            with self.assertRaises(PermissionDenied):
+                self.middleware(request)
+
+    def test_an_existing_parent_invited_to_a_second_school_waits_at_the_door(self):
+        """The case this rule exists for: they can already sign in elsewhere."""
+        child = services.enroll_student(make_user("STM/1", "Ada Ade"), self.school)
+        parent = make_user("08031234567", "Bisi Ade", phone="08031234567")
+        services.link_guardian(parent, child)
+
+        Membership.objects.create(
+            user=parent,
+            school=self.grace,
+            role=Role.PARENT,
+            status=MembershipStatus.INVITED,
+        )
+
+        self.assertTrue(parent.has_access_to(self.school))
+        self.assertFalse(parent.has_access_to(self.grace))
+        self.assertEqual(parent.live_memberships().count(), 2)  # relationship exists
+
+    def test_a_parent_sees_an_invited_child_before_that_child_can_sign_in(self):
+        parent = make_user("08031234567", "Bisi Ade", phone="08031234567")
+        child = services.enroll_student(
+            make_user("STM/1", "Ada Ade"), self.school, status=MembershipStatus.INVITED
+        )
+        services.link_guardian(parent, child)
+
+        self.assertEqual(parent.children().count(), 1)
+        self.assertEqual(
+            [c.user.full_name for _, kids in services.parent_dashboard(parent) for c in kids],
+            ["Ada Ade"],
+        )
+        self.assertFalse(child.user.has_access_to(self.school))
+        self.assertEqual(child.user.student_membership(), child)  # still their school
+
+    def test_an_invited_student_still_occupies_their_one_school(self):
+        child = make_user("STM/1", "Ada Ade")
+        services.enroll_student(child, self.school, status=MembershipStatus.INVITED)
+        with self.assertRaises(services.AlreadyEnrolled):
+            services.enroll_student(child, self.grace)
+
+    def test_the_two_predicates_are_distinct_on_the_membership(self):
+        membership = services.grant_membership(
+            self.teacher, self.school, Role.TEACHER, status=MembershipStatus.SUSPENDED
+        )
+        self.assertTrue(membership.is_live)  # relationship exists
+        self.assertFalse(membership.grants_access)  # but cannot act
+
+
+class DeletingASchoolIsProtectedTests(TestCase):
+    """Family history must not disappear as a side effect of an unrelated delete."""
+
+    def setUp(self):
+        self.school = make_school("St Mary's", "st-marys", "st_marys")
+        self.parent = make_user("08031234567", "Bisi Ade", phone="08031234567")
+        self.child = services.enroll_student(make_user("STM/1", "Ada Ade"), self.school)
+        services.link_guardian(self.parent, self.child)
+
+    def test_a_school_with_memberships_cannot_be_deleted(self):
+        with self.assertRaises(ProtectedError), transaction.atomic():
+            self.school.delete()
+
+        self.assertTrue(School.objects.filter(pk=self.school.pk).exists())
+        self.assertEqual(Membership.objects.filter(school=self.school).count(), 2)
+        self.assertEqual(Guardianship.objects.count(), 1)
+
+    def test_ending_memberships_does_not_unlock_the_delete(self):
+        """Ended rows *are* the history, so they keep protecting the school."""
+        for membership in Membership.objects.filter(school=self.school):
+            membership.end()
+
+        with self.assertRaises(ProtectedError), transaction.atomic():
+            self.school.delete()
+        self.assertTrue(School.objects.filter(pk=self.school.pk).exists())
+
+    def test_a_school_nobody_ever_joined_can_be_deleted(self):
+        empty = make_school("Kings College", "kings", "kings")
+        empty.delete()
+        self.assertFalse(School.objects.filter(slug="kings").exists())
+
+    def test_a_guardian_cannot_be_deleted_while_a_link_remains(self):
+        with self.assertRaises(ProtectedError), transaction.atomic():
+            self.parent.delete()
+        self.assertTrue(User.objects.filter(pk=self.parent.pk).exists())
+        self.assertEqual(Guardianship.objects.count(), 1)
+
+    def test_a_child_cannot_be_deleted_while_a_guardian_is_linked(self):
+        """Their membership would cascade, and the guardianship protects it."""
+        with self.assertRaises(ProtectedError), transaction.atomic():
+            self.child.user.delete()
+        self.assertEqual(Guardianship.objects.count(), 1)
+
+    def test_unlinking_first_makes_deletion_possible(self):
+        services.unlink_guardian(self.parent, self.child)
+        self.assertEqual(Guardianship.objects.count(), 0)
+
+        self.parent.delete()
+        self.assertFalse(User.objects.filter(username="08031234567").exists())
+        self.assertTrue(Membership.objects.filter(pk=self.child.pk).exists())
 
 
 class StudentsDoNotSeeSiblingsTests(TestCase):
