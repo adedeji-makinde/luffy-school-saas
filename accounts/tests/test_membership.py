@@ -520,6 +520,33 @@ class AccessRequiresActiveStatusTests(TestCase):
         with self.assertRaises(services.AlreadyEnrolled):
             services.enroll_student(child, self.grace)
 
+    def test_the_school_directory_shows_pending_and_suspended_people(self):
+        """A roster is visibility, not access — deliberately the wider predicate."""
+        for name, status in (
+            ("Active Teacher", MembershipStatus.ACTIVE),
+            ("Invited Teacher", MembershipStatus.INVITED),
+            ("Suspended Teacher", MembershipStatus.SUSPENDED),
+            ("Departed Teacher", MembershipStatus.ENDED),
+        ):
+            services.grant_membership(
+                make_user(name.lower().replace(" ", "-"), name),
+                self.school,
+                Role.TEACHER,
+                status=status,
+            )
+
+        listed = {m.user.full_name for m in services.school_directory(self.school)}
+        self.assertEqual(
+            listed, {"Active Teacher", "Invited Teacher", "Suspended Teacher"}
+        )
+
+        # ...even though only the active one may actually act at the school.
+        allowed = {
+            m.user.full_name
+            for m in Membership.objects.for_school(self.school).with_access()
+        }
+        self.assertEqual(allowed, {"Active Teacher"})
+
     def test_the_two_predicates_are_distinct_on_the_membership(self):
         membership = services.grant_membership(
             self.teacher, self.school, Role.TEACHER, status=MembershipStatus.SUSPENDED

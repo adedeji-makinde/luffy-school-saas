@@ -69,7 +69,7 @@ both directions. Keep them apart:
 
 | Question | Predicate | Statuses | Used by |
 | --- | --- | --- | --- |
-| Does the relationship exist? | `LIVE_STATUSES` / `.live()` | invited, active, suspended | the one-school slot, `children()`, `student_membership()` |
+| Does the relationship exist? | `LIVE_STATUSES` / `.live()` | invited, active, suspended | the one-school slot, `children()`, `student_membership()`, `school_directory()` |
 | May they act at the school? | `ACCESS_STATUSES` / `.with_access()` | active only | `has_access_to()`, `roles_at()`, the middleware, `can_grant_memberships()` |
 
 An invitation is an offer, not access, and a suspension withdraws access without

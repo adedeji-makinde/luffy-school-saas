@@ -272,6 +272,13 @@ def parent_dashboard(guardian):
 
 
 def school_directory(school, *, role=None):
-    """Everyone at one school, optionally filtered to a single role."""
+    """Everyone at one school, optionally filtered to a single role.
+
+    Relationship-scoped on purpose, so invited and suspended people appear
+    alongside active ones. A school's own directory should show who is pending
+    and who is suspended rather than hiding them — that is the roster the office
+    works from. Do not narrow this to `with_access()`; access and visibility are
+    different questions.
+    """
     qs = Membership.objects.for_school(school).live().select_related("user")
     return qs.filter(role=role) if role else qs
