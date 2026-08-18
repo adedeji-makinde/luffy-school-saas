@@ -20,6 +20,8 @@ from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 
+from .identifiers import canonical_username, normalize_email, normalize_phone, try_normalize_phone
+
 
 class Role(models.TextChoices):
     """Every role that gets a login. There is no flat "staff" role."""
@@ -89,18 +91,33 @@ class Relationship(models.TextChoices):
 
 
 class UserManager(BaseUserManager):
-    def _normalize(self, email, phone):
-        # Blank strings would collide under the unique indexes; NULLs do not.
-        return (self.normalize_email(email).lower() or None if email else None, phone or None)
-
     def create_user(self, username, password=None, *, email=None, phone=None, **extra):
         if not username:
             raise ValueError("A username is required.")
-        email, phone = self._normalize(email, phone)
+        # save() normalizes username/email/phone, so raw input is fine here.
         user = self.model(username=username, email=email, phone=phone, **extra)
         user.set_password(password)
         user.save(using=self._db)
         return user
+
+    def matching_identifier(self, identifier):
+        """Every user `identifier` could refer to, as one query.
+
+        Checks username and email case-insensitively, and phone by its
+        normalized value when `identifier` is phone-shaped. This is the
+        single source of truth for identifier resolution: both
+        User.assert_identifiers_unambiguous() and IdentifierBackend call
+        this, so the collision rule and the sign-in resolution can never
+        drift apart.
+        """
+        identifier = (identifier or "").strip()
+        if not identifier:
+            return self.none()
+        query = Q(username__iexact=identifier) | Q(email__iexact=identifier)
+        phone = try_normalize_phone(identifier)
+        if phone:
+            query |= Q(phone=phone)
+        return self.filter(query)
 
     def create_superuser(self, username, password=None, *, email=None, phone=None, **extra):
         extra.setdefault("is_platform_staff", True)
@@ -122,7 +139,9 @@ class User(AbstractBaseUser, PermissionsMixin):
         unique=True,
         help_text=(
             "Stable sign-in handle. Staff and parents usually get their email; "
-            "students get a school-issued handle such as STM/2026/0042."
+            "students get a school-issued handle such as STM/2026/0042. A "
+            "username that is itself a phone number is stored in E.164, "
+            "matching the phone field."
         ),
     )
     # Optional: a young student may have neither. Unique when present.
@@ -150,9 +169,49 @@ class User(AbstractBaseUser, PermissionsMixin):
         return self.full_name or self.username
 
     def save(self, *args, **kwargs):
-        self.email = (self.email or "").lower() or None
-        self.phone = self.phone or None
+        self.normalize_identifiers()
+        update_fields = kwargs.get("update_fields")
+        # update_last_login fires on every sign-in and only ever touches
+        # last_login, so it must not pay for a collision check that can't
+        # possibly apply to it. Any save that could touch an identifier
+        # column — including a plain save() with no update_fields at all —
+        # still runs the check.
+        if update_fields is None or set(update_fields) & {"username", "email", "phone"}:
+            self.assert_identifiers_unambiguous()
         super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        self.normalize_identifiers()
+        self.assert_identifiers_unambiguous()
+
+    def normalize_identifiers(self):
+        self.username = canonical_username(self.username)
+        self.email = normalize_email(self.email)
+        self.phone = normalize_phone(self.phone)
+
+    def assert_identifiers_unambiguous(self):
+        """Option C: refuse to save if an identifier of this user's already
+        resolves to a different account.
+
+        Application-level, not (yet) a database constraint, and racy by
+        construction: two concurrent saves can both pass this SELECT before
+        either commits, because there is no row yet for either to lock
+        against. Only this cross-column comparison rides on that race —
+        same-column uniqueness (two users sharing one phone, say) is still
+        enforced by real unique indexes regardless of this check. Acceptable
+        pre-launch because the failure mode is safe: a genuinely ambiguous
+        identifier is refused at sign-in (see IdentifierBackend), never
+        silently resolved to the wrong person. The upgrade path is a
+        UserIdentifier(kind, canonical_value) table with one unique index
+        spanning all three kinds — a change of mechanism, not of rule.
+        """
+        for value in filter(None, {self.username, self.email, self.phone}):
+            matches = User.objects.matching_identifier(value)
+            if self.pk is not None:
+                matches = matches.exclude(pk=self.pk)
+            if matches.exists():
+                raise ValidationError(f"{value!r} is already in use by another account.")
 
     def get_full_name(self):
         return self.full_name
