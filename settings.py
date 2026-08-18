@@ -60,6 +60,11 @@ AUTH_USER_MODEL = "accounts.User"
 # reach for different identifiers, so accept any of username / email / phone.
 AUTHENTICATION_BACKENDS = ["accounts.backends.IdentifierBackend"]
 
+# Parsing default only, not a restriction: a number typed with no country
+# code is read as Nigerian, but any other country's numbers are still valid.
+# See accounts/identifiers.py.
+PHONE_DEFAULT_REGION = os.environ.get("PHONE_DEFAULT_REGION", "NG")
+
 ROOT_URLCONF = "urls"
 
 DATABASES = {
