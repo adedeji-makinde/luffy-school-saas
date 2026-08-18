@@ -13,7 +13,10 @@ exactly the thing this model exists to avoid.
 
 The isolation that matters is still intact: a school's records never leave its schema,
 and reaching them requires a live `Membership` for that school
-(`accounts.middleware.SchoolAccessMiddleware`).
+(`accounts.middleware.SchoolAccessMiddleware`). That half of the claim is no longer
+taken on trust — see [tenancy.md](tenancy.md) for what was verified against a real
+Postgres, and for the open blocker on foreign keys from a tenant table back to
+anything in here.
 
 ## Everyone gets an account
 
