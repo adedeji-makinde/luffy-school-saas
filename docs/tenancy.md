@@ -36,6 +36,10 @@ alone, so each one really does run `CREATE SCHEMA` followed by the full
 `migrate_schemas` pass for `TENANT_APPS`. The assertions read `pg_namespace`,
 `pg_tables`, `pg_indexes` and `pg_constraint` rather than taking Django's word.
 
+`schools/tests/test_cross_schema_fk.py` — 6 tests, holding the evidence for the
+blocker at the bottom of this document. Real Django models with real foreign
+keys into `public`, real `.delete()` calls, across two real schemas.
+
 The same thing was also run by hand against the dev database first. `\dn` after
 creating two real tenants through `School`/`Domain`:
 
@@ -179,25 +183,58 @@ ALTER TABLE "accounts_membership" ADD CONSTRAINT "..."
   DEFERRABLE INITIALLY DEFERRED;
 ```
 
-so `confdeltype` is `a` — `NO ACTION`. Two consequences, and the second is the
-dangerous one:
+so `confdeltype` is `a` — `NO ACTION`, and `condeferred` is true.
 
-1. **Django's `on_delete` is not honoured across schemas.** The deletion
-   collector walks Django model relations against the *currently connected*
-   schema only. It cannot see, cascade into, or be protected by rows sitting in
-   the other forty schools.
-2. **The failure is deferred to `COMMIT`.** Because the constraint is
-   `INITIALLY DEFERRED`, deleting a shared row referenced from tenant schemas
-   *appears to succeed*. The `DELETE` returns cleanly, the code proceeds, and
-   the transaction then blows up at commit time with an `IntegrityError` naming
-   a table in a schema the connection was never pointed at. It cannot be caught
-   at the point of the delete, because nothing goes wrong there.
+This was measured end to end through the ORM, not inferred.
+`schools/tests/test_cross_schema_fk.py` defines real Django models with real
+`ForeignKey`s to `accounts.User` — one `CASCADE`, one `PROTECT` — creates their
+tables in two real school schemas, and calls `.delete()`. (They are registered
+for the life of that test class only and never migrated, because shipping a
+tenant→shared foreign key is the thing this section forbids.) Three findings,
+each worse than the last:
 
-Honest note on how strong that evidence is: the failure mode was reproduced by
-hand-writing the exact DDL Django emits (verified against `sqlmigrate` output
-above) rather than by building a real Django model with a real `ForeignKey`.
-The mechanism is confirmed; the ergonomics of hitting it through the ORM are
-inferred from the collector's design rather than observed end to end.
+**1. `on_delete` is not honoured across schemas.** The deletion collector does
+know about the relation — it is a real Django model and `related_objects`
+includes it. It simply resolves the relation against the *currently connected*
+schema. Deleting a user while connected to St Mary's cascades St Mary's rows
+and never looks at Grace Academy's, which are left pointing at a row that no
+longer exists.
+
+**2. The delete is silent, and the failure lands at `COMMIT`.** Observed
+directly: `user.delete()` raised `None`, the user really was removed from
+`public.accounts_user`, and Grace Academy was still holding a live reference to
+it. Nothing at all goes wrong at the point of the mistake. Only when the
+deferred constraint is finally checked does it come apart:
+
+```
+user.delete() raised: None            <-- silent
+grace rows still referencing the deleted user: 1
+user gone from public: True
+check_constraints() -> IntegrityError:
+  insert or update on table "academics_probecascade" violates foreign key
+  constraint "academics_probecascade_student_id_..._fk_accounts_user_id"
+  DETAIL:  Key (student_id)=(7) is not present in table "accounts_user".
+```
+
+Note the wording, because it will cost someone an afternoon: Postgres reports a
+deferred violation as **"insert or update on table"** even though the statement
+was a `DELETE`, and names a table in a schema the connection was never pointed
+at. The traceback points at the commit, not at the delete.
+
+**3. `PROTECT` does not protect — and that is the worst part.** `PROTECT` works
+by querying the referencing table, so from St Mary's that query finds nothing
+and the delete proceeds. Measured: deleting a user referenced only from Grace
+Academy, while connected to St Mary's, raised **no `ProtectedError` at all**. It
+fails later as an `IntegrityError`, which is not what any calling code will be
+catching. The guarantee most likely to be reached for as a safety net is
+precisely the one that silently does not apply.
+
+There is a fourth point that is really a warning about testing: **a
+single-school deployment cannot reveal any of this.** With one school the
+connected schema is the only schema, so cascade tidies everything and `PROTECT`
+protects correctly. Every failure above appears the moment a second school
+exists, and not one moment before. That is why this is a blocker rather than
+something to notice in review.
 
 Why it was not decided now: `Term` genuinely does not need it, and the decision
 is much better made against a concrete model where the real `on_delete`
