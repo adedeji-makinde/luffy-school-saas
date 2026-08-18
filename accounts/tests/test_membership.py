@@ -9,6 +9,7 @@ from django.db.models import ProtectedError
 from django.test import RequestFactory, TestCase
 
 from accounts import services
+from accounts.deletion import _sanctioned_delete
 from accounts.middleware import SchoolAccessMiddleware
 from accounts.models import (
     FAMILY_ROLES,
@@ -599,10 +600,20 @@ class DeletingASchoolIsProtectedTests(TestCase):
         self.assertEqual(Guardianship.objects.count(), 1)
 
     def test_unlinking_first_makes_deletion_possible(self):
+        """What this pins is the `Guardianship` PROTECT, not deletion policy.
+
+        `_sanctioned_delete()` lifts the `pre_delete` guard in
+        accounts/deletion.py, which would otherwise refuse this before the
+        collector ran and there would be nothing left to measure. Application
+        policy is now stricter than the constraint tested here — an ended
+        membership still blocks a real hard delete; see
+        accounts/tests/test_deletion.py.
+        """
         services.unlink_guardian(self.parent, self.child)
         self.assertEqual(Guardianship.objects.count(), 0)
 
-        self.parent.delete()
+        with _sanctioned_delete():
+            self.parent.delete()
         self.assertFalse(User.objects.filter(username="08031234567").exists())
         self.assertTrue(Membership.objects.filter(pk=self.child.pk).exists())
 

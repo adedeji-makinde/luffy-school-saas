@@ -153,6 +153,36 @@ in step. That leaves `Membership.user` as the one remaining cascade, which is a 
 *about* that person rather than a side effect — and it is still blocked while any
 guardianship references them.
 
+### Removing a person
+
+Deactivate, don't delete. `accounts.deletion.deactivate_user()` clears `is_active`,
+which `IdentifierBackend` refuses at sign-in via the inherited
+`user_can_authenticate()`, while every membership, guardianship and school record
+stays where it was. It is reversible with `reactivate_user()`.
+
+Permanently removing the row goes through `accounts.deletion.hard_delete_user()` and
+nothing else, and that is enforced rather than asked for. A `pre_delete` receiver on
+`User` refuses every delete that `hard_delete_user()` did not open the door for, so
+`user.delete()` in a view and `User.objects.filter(...).delete()` in a shell both
+raise. Registering the receiver also costs the collector its fast path — Django
+disables `can_fast_delete()` for a model with `pre_delete` listeners — so a bulk
+delete can no longer skip per-object signals.
+
+Being a plain function rather than a manager or queryset method still matters, but
+only for API shape: it keeps a hard delete off the end of a chain. The receiver is
+what makes it a guarantee.
+
+`hard_delete_user()` refuses — `ValidationError`, naming each schema — while anything
+still references the user, ended memberships included. Tests that need the raw
+behaviour underneath the policy lift it with `_sanctioned_delete()` — three test
+files do, each saying why at the point it does.
+
+The guard exists because `on_delete` cannot see across schemas: `PROTECT` queries the
+referencing table in the *connected* schema only, so a reference held by another
+school raises nothing and the transaction fails later at `COMMIT`. See
+[tenancy.md](tenancy.md#hard-blocker-tenant--shared-foreign-keys) and
+`accounts/tests/test_deletion.py`.
+
 Worth knowing why both sides need protecting rather than just one: `Guardianship.guardian`
 points at the parent's **User**, not their PARENT membership. Before `PROTECT`, deleting a
 parent's membership left the link behind, so `children()` still listed the child while
