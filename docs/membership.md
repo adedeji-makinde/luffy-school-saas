@@ -164,6 +164,82 @@ indexes don't collide. Students get a school-issued handle (`STM/2026/0042`) bec
 many have no email address; parents commonly use the phone number the school has on
 file.
 
+## Identifiers: one phone number, one account
+
+Before this, `phone` was stored as whatever string was typed. `08031234567`
+and `+2348031234567` are the same person's number, but as exact strings they
+are different — so one family could show up as two accounts, one holding the
+mother's PARENT membership and the other holding half the children, split by
+nothing but which form of their own phone number they happened to type on
+which form. `accounts/identifiers.py` fixes this by normalizing every phone
+number to E.164 (`+2348031234567`) via the `phonenumbers` library before it
+is saved or compared, rather than hand-rolling that parsing.
+
+`settings.PHONE_DEFAULT_REGION` (`NG`) is a **parsing default, not a
+restriction**: a number typed with no country code is read as Nigerian, but
+any valid number from anywhere — another country, a landline, a toll-free
+line — is accepted as-is. This is enforced with `is_valid_number`, never
+`is_valid_number_for_region`.
+
+**Usernames are normalized too, but only under a strict gate.** A naive
+normalizer that tried to phone-ify every username would rewrite a
+school-issued handle like `STM-08031234567` into an actual phone number, and
+worse, could collide two different students' handles that differ only in
+punctuation. So `canonical_username()` only normalizes a username when the
+**entire string** is made of digits and phone punctuation
+(`^[+()\d\s.\-]+$`) — one letter, colon, or slash disqualifies it outright.
+`STM-08031234567` and `tel:08031234567` are left untouched; `0803 123 4567`
+becomes `+2348031234567`. When a username *is* phone-shaped, its stored form
+matches `User.phone`'s E.164 form exactly, so the two can agree without
+colliding on the same account (see `User.assert_identifiers_unambiguous()`).
+
+## Sign-in collisions: Option C, not a database constraint yet
+
+Same-column uniqueness — two users sharing one `phone`, one `email`, or one
+`username` — is enforced by real unique indexes and always has been. The gap
+this closes is **cross-column**: nothing stopped one user's `username` from
+being identical to a different user's `phone`, since they live in different
+columns with different indexes. `IdentifierBackend` used to resolve that
+case with `order_by("pk").first()` — an arbitrary pick with no real policy,
+silently signing whoever typed that identifier into one of two unrelated
+accounts.
+
+The fix, deliberately **Option C**: an application-level check,
+`User.assert_identifiers_unambiguous()`, rather than a database-level
+constraint. It runs on save via `User.matching_identifier()` — a single
+query, on `UserManager`, that resolves an identifier against
+username/email/phone in one shot. Both the model's check and
+`IdentifierBackend.authenticate()` call this same method, on purpose: the
+collision rule and the sign-in resolution read from one place, so they
+cannot drift apart the way the old `order_by("pk")` guess could from
+whatever the "real" rule was supposed to be.
+
+**This is racy by construction, and that is a known, accepted limitation.**
+Two concurrent transactions can both run `assert_identifiers_unambiguous()`,
+both see no conflicting row yet, and both commit — because a `SELECT`
+against a row that doesn't exist yet locks nothing. Only the cross-column
+comparison rides on this gap; same-column uniqueness is still a real
+database constraint regardless of this check's outcome. It is acceptable
+pre-launch because the failure mode is safe: a genuinely ambiguous
+identifier is **refused at sign-in**, never silently resolved to the wrong
+person. `IdentifierBackend` refuses to authenticate rather than pick one
+when `matching_identifier()` returns more than one user — this replaces
+`order_by("pk").first()` entirely, not just for the cross-column case.
+
+The check is skipped when a save's `update_fields` excludes all three
+identifier columns, so `update_last_login` — which fires on every sign-in
+and only ever touches `last_login` — pays no extra query for a check that
+cannot possibly apply to it. A save with `update_fields=None`, or one that
+touches `username`/`email`/`phone`, still runs it.
+
+**The upgrade path, for later:** a `UserIdentifier(kind, canonical_value)`
+table with one unique index spanning all three kinds, so the database
+itself makes cross-column collisions impossible instead of merely unlikely.
+That is a change of *mechanism* — swapping the racy check for a real
+constraint — not a change of *rule*: an ambiguous identifier is refused
+either way. Nothing about the current `User.phone`/`User.email`/
+`User.username` shape needs to change to get there later.
+
 ## Open items
 
 Both deliberately deferred, not overlooked. Neither is started.
