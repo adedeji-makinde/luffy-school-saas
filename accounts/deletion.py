@@ -6,12 +6,21 @@ history of what they did at a school all stay exactly where they were, and
 `ModelBackend.user_can_authenticate()` — which `IdentifierBackend` inherits —
 refuses the sign-in from that moment on. Reversing it is one field.
 
-Permanently deleting the row is a different thing, and this module is the only
-sanctioned way to do it. `hard_delete_user()` is a plain function rather than a
-manager or queryset method **on purpose**: there must be no way to reach a hard
-delete by ordinary chaining. `User.objects.filter(...).delete()` never routes
-through here, and that is exactly the point — a bulk queryset delete is how a
-row disappears without anyone deciding it should.
+Permanently deleting the row is a different thing, and `hard_delete_user()` is
+the only way to do it. Two mechanisms, because either alone is not enough:
+
+It is a plain function rather than a manager or queryset method, so a hard
+delete cannot be reached by ordinary chaining. That shapes the API but enforces
+nothing on its own — `.delete()` still exists on every instance and queryset,
+and an earlier version of this module claimed the absence of a manager method as
+a safety property when it was only a naming choice.
+
+So `block_unsanctioned_delete()` below refuses any `pre_delete` on `User` unless
+`hard_delete_user()` opened the door for it. That is what makes "the only way"
+literally true: `user.delete()` in a view, `User.objects.filter(...).delete()`
+in a shell, a cascade from somewhere else — all of them raise. The only bypass
+is the thread-local sentinel, which is set around exactly one `delete()` call
+and restored afterwards.
 
 Why a hard delete needs a guard at all
 --------------------------------------
@@ -34,9 +43,14 @@ who holds a single membership. Hence the split: shared relations are counted
 once in `public`, tenant-local relations once per school schema.
 """
 
+import contextlib
+import threading
+
 from django.conf import settings
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import transaction
+from django.db.models.signals import pre_delete
+from django.dispatch import receiver
 from django_tenants.utils import (
     app_labels,
     get_public_schema_name,
@@ -51,6 +65,48 @@ from .models import User
 #: legitimately appears in both sets and is checked both ways.
 SHARED_APP_LABELS = frozenset(app_labels(settings.SHARED_APPS))
 TENANT_APP_LABELS = frozenset(app_labels(settings.TENANT_APPS))
+
+
+#: Thread-local rather than a module-level flag, and deliberately so: a plain
+#: bool would be shared by every worker thread, so one sanctioned delete would
+#: hold the door open for anything another request happened to be deleting at
+#: the same moment. The whole guarantee below rests on this being per-thread.
+_sanctioned = threading.local()
+
+
+@contextlib.contextmanager
+def _sanctioned_delete():
+    """Open the door for exactly one `delete()` call on this thread."""
+    previous = getattr(_sanctioned, "allowed", False)
+    _sanctioned.allowed = True
+    try:
+        yield
+    finally:
+        _sanctioned.allowed = previous
+
+
+@receiver(pre_delete, sender=User, dispatch_uid="accounts.deletion.block_hard_delete")
+def block_unsanctioned_delete(sender, instance, **kwargs):
+    """Make the policy real instead of documented.
+
+    Without this, `hard_delete_user()` is a function people are asked to
+    remember. `user.delete()` and `User.objects.filter(...).delete()` still work
+    from any view or shell, still cascade `Membership.user` away, and never run
+    the scan. Being a module-level function keeps a hard delete off the end of a
+    queryset chain; it does not stop `.delete()` existing.
+
+    A second, quieter effect: `Collector.can_fast_delete()` returns False for a
+    model with `pre_delete` listeners, so a bulk queryset delete can no longer
+    take the fast path that skips per-object signals. Every route into deleting
+    a user now passes through here.
+    """
+    if not getattr(_sanctioned, "allowed", False):
+        raise ValidationError(
+            f"Refusing to delete {instance}: deleting a User directly is not "
+            "supported. Deactivate them with accounts.deletion.deactivate_user(), "
+            "or call accounts.deletion.hard_delete_user(), which checks every "
+            "schema for references first."
+        )
 
 
 class Reference:
@@ -89,20 +145,58 @@ def reactivate_user(user, *, save=True):
     return user
 
 
+def _reverse_relations_into_user():
+    """Every relation pointing at `User`, hidden ones included.
+
+    Not `_meta.related_objects`, which is the obvious choice and the wrong one:
+    it drops relations declared `related_name="+"`, and its own docstring calls
+    itself "Private API intended only to be used by Django itself". The deletion
+    collector reads `get_fields(include_hidden=True)`, so a hidden ForeignKey is
+    something Django will happily delete against while a scan built on
+    `related_objects` cannot see it at all — the guard would pass and the commit
+    would still fail. Read the same set the collector reads.
+
+    `auto_created and not concrete` is what isolates reverse relations: forward
+    fields are concrete, and the auto primary key is concrete too.
+
+    Wider than the collector's candidate set on purpose — many-to-many relations
+    are kept, because the question here is "does anything still reference this
+    person", which is broader than "what would the collector delete".
+    """
+    return [
+        field
+        for field in User._meta.get_fields(include_hidden=True)
+        if field.auto_created and not field.concrete
+    ]
+
+
 def _relations_into_user():
     """Every relation pointing at `User`, split by where its table lives.
 
     Read off the app registry rather than hard-coded, so a tenant model added
     later is covered the day it exists instead of the day someone remembers to
     add it here.
+
+    An app in neither setting is an error rather than an empty result. Silently
+    dropping it would mean a relation nobody scans, which is the one outcome
+    this module must never produce — and installing an app by appending it to
+    `INSTALLED_APPS` instead of to `SHARED_APPS` is exactly how that happens.
     """
     shared, tenant_local = [], []
-    for relation in User._meta.related_objects:
+    for relation in _reverse_relations_into_user():
         app_label = relation.related_model._meta.app_label
         if app_label in SHARED_APP_LABELS:
             shared.append(relation)
         if app_label in TENANT_APP_LABELS:
             tenant_local.append(relation)
+        if app_label not in SHARED_APP_LABELS and app_label not in TENANT_APP_LABELS:
+            raise ImproperlyConfigured(
+                f"{relation.related_model._meta.label} references accounts.User, but "
+                f"its app {app_label!r} is in neither SHARED_APPS nor TENANT_APPS, so "
+                "there is no way to know which schema its table lives in. Add it to "
+                "whichever it belongs to; appending it to INSTALLED_APPS alone leaves "
+                "it unscanned by accounts.deletion."
+            )
     return shared, tenant_local
 
 
@@ -195,16 +289,28 @@ def hard_delete_user(user):
     """
     references = find_references(user)
     if references:
+        schemas = {reference.schema_name for reference in references}
+        # A list of messages, not one string with newlines in it. ValidationError
+        # renders as `repr(self.messages)`, so an embedded "\n" comes back out as
+        # a literal backslash-n inside a list repr — the formatting would survive
+        # only until someone logged it. Each line is its own message instead, and
+        # `exc.messages` hands them back cleanly.
         raise ValidationError(
-            f"Refusing to hard-delete {user}: still referenced in "
-            f"{len({reference.schema_name for reference in references})} schema(s).\n"
-            + "\n".join(f"  {reference}" for reference in sorted(
-                references, key=lambda reference: (reference.schema_name, reference.model._meta.label)
-            ))
-            + "\nDeactivate the user instead (accounts.deletion.deactivate_user), "
-            "or remove those references first."
+            [f"Refusing to hard-delete {user}: still referenced in {len(schemas)} schema(s)."]
+            + [
+                str(reference)
+                for reference in sorted(
+                    references,
+                    key=lambda reference: (reference.schema_name, reference.model._meta.label),
+                )
+            ]
+            + [
+                "Deactivate the user instead (accounts.deletion.deactivate_user), "
+                "or remove those references first."
+            ]
         )
 
     _, tenant_local = _relations_into_user()
     with schema_context(_deletion_schema(tenant_local)):
-        return user.delete()
+        with _sanctioned_delete():
+            return user.delete()

@@ -161,11 +161,21 @@ which `IdentifierBackend` refuses at sign-in via the inherited
 stays where it was. It is reversible with `reactivate_user()`.
 
 Permanently removing the row goes through `accounts.deletion.hard_delete_user()` and
-nothing else. It is a plain function rather than a manager or queryset method on
-purpose: there must be no way to reach a hard delete by ordinary chaining, because
-`User.objects.filter(...).delete()` is how a person disappears without anyone
-deciding they should. It refuses — `ValidationError`, naming each schema — while
-anything still references the user, ended memberships included.
+nothing else, and that is enforced rather than asked for. A `pre_delete` receiver on
+`User` refuses every delete that `hard_delete_user()` did not open the door for, so
+`user.delete()` in a view and `User.objects.filter(...).delete()` in a shell both
+raise. Registering the receiver also costs the collector its fast path — Django
+disables `can_fast_delete()` for a model with `pre_delete` listeners — so a bulk
+delete can no longer skip per-object signals.
+
+Being a plain function rather than a manager or queryset method still matters, but
+only for API shape: it keeps a hard delete off the end of a chain. The receiver is
+what makes it a guarantee.
+
+`hard_delete_user()` refuses — `ValidationError`, naming each schema — while anything
+still references the user, ended memberships included. Tests that need the raw
+behaviour underneath the policy lift it with `_sanctioned_delete()` — three test
+files do, each saying why at the point it does.
 
 The guard exists because `on_delete` cannot see across schemas: `PROTECT` queries the
 referencing table in the *connected* schema only, so a reference held by another

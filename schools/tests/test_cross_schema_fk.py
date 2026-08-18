@@ -7,6 +7,13 @@ prints, which confirmed the *mechanism* but left the ORM ergonomics inferred
 from the deletion collector's design rather than observed. This file closes
 that gap with real Django models, a real ForeignKey and a real `.delete()`.
 
+Every `user.delete()` below runs inside `_sanctioned_delete()`. That is not the
+subject of these tests — it is how they reach past `accounts.deletion`'s
+`pre_delete` guard, which now refuses an unsanctioned delete before any of this
+can happen. What is measured here is what Django and Postgres do underneath that
+policy, and it is the reason the policy exists; lifting the guard deliberately,
+in the one file that documents the failure, keeps that evidence readable.
+
 Why the probe models are defined here instead of in academics/models.py:
 shipping a tenant→shared ForeignKey is exactly what the blocker forbids, so
 these must not exist in any migration or reach any real schema. They are
@@ -21,6 +28,7 @@ from django.db import IntegrityError, connection, models, transaction
 from django.db.models.deletion import Collector, ProtectedError
 from django.test import TestCase
 
+from accounts.deletion import _sanctioned_delete
 from accounts.models import User
 from schools.tests.test_tenant_isolation import (
     PASSWORD,
@@ -143,7 +151,8 @@ class CrossSchemaForeignKeyTests(TestCase):
 
         with connected_to(self.stmarys):
             with transaction.atomic():
-                user.delete()
+                with _sanctioned_delete():
+                    user.delete()
                 # St Mary's rows were cascaded away...
                 self.assertEqual(
                     self._rows_in("st_marys", "academics_probecascade"), 0
@@ -168,7 +177,8 @@ class CrossSchemaForeignKeyTests(TestCase):
             with self.assertRaises(IntegrityError) as caught:
                 with transaction.atomic():
                     # No exception here. This is the whole problem.
-                    user.delete()
+                    with _sanctioned_delete():
+                        user.delete()
                     # Stand-in for COMMIT: SET CONSTRAINTS ALL IMMEDIATE, which
                     # is exactly what Postgres does when the transaction ends.
                     connection.check_constraints()
@@ -194,14 +204,16 @@ class CrossSchemaForeignKeyTests(TestCase):
         with connected_to(self.grace):
             with self.assertRaises(ProtectedError):
                 with transaction.atomic():
-                    user.delete()
+                    with _sanctioned_delete():
+                        user.delete()
 
         # But from the other school it raises nothing, and only the deferred
         # constraint catches it -- as an IntegrityError, not a ProtectedError.
         with connected_to(self.stmarys):
             with self.assertRaises(IntegrityError):
                 with transaction.atomic():
-                    user.delete()
+                    with _sanctioned_delete():
+                        user.delete()
                     connection.check_constraints()
 
     def test_a_single_tenant_deployment_would_never_reveal_any_of_this(self):
@@ -216,7 +228,8 @@ class CrossSchemaForeignKeyTests(TestCase):
             self.ProbeCascade.objects.create(student=user)
 
             with transaction.atomic():
-                user.delete()
+                with _sanctioned_delete():
+                    user.delete()
                 connection.check_constraints()  # no complaint
                 self.assertEqual(
                     self._rows_in("st_marys", "academics_probecascade"), 0
