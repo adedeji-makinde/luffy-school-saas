@@ -240,6 +240,33 @@ class TokenLifecycleTests(InvitationSetUp):
         self.assertEqual(second.membership_id, first.membership_id)
         self.assertEqual(Invitation.objects.count(), 2)
 
+    def test_an_accepted_invitation_cannot_be_resent(self):
+        """Enforced in the service, not only at the HTTP edge.
+
+        Minting a fresh token against a membership that is already ACTIVE would
+        put a working credential for a live account into somebody's inbox.
+        """
+        with recording():
+            invitation, _ = self.invite()
+        invitation.accept(password="already-in-thanks")
+
+        with self.assertRaises(invitation_service.AlreadyAccepted):
+            invitation_service.resend_invitation(self.admin, invitation)
+        self.assertEqual(Invitation.objects.count(), 1)
+
+    def test_a_revoked_or_expired_invitation_may_be_resent(self):
+        with recording():
+            invitation, _ = self.invite()
+        invitation_service.revoke_invitation(self.admin, invitation)
+
+        with recording():
+            fresh, token = invitation_service.resend_invitation(
+                self.admin, invitation, accept_url_for=lambda t: f"https://portal/i/{t}/"
+            )
+
+        self.assertEqual(Invitation.validate_token(token), fresh)
+        self.assertEqual(fresh.membership_id, invitation.membership_id)
+
     def test_an_unknown_token_is_simply_none(self):
         self.assertIsNone(Invitation.validate_token("not-a-real-token"))
         self.assertIsNone(Invitation.validate_token(""))

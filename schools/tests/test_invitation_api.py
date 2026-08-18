@@ -239,6 +239,125 @@ class InvitationApiTests(TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 404)  # spent reads as unknown
 
+    # -- POST /api/schools/{slug}/invitations/{id}/resend/ --------------------
+
+    def test_resending_issues_a_new_token_and_kills_the_old_one(self):
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        first_token = self.raw_token_of_last_invite()
+        first_id = created.json()["id"]
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/schools/st-marys/invitations/{first_id}/resend/"
+            )
+
+        self.assertEqual(response.status_code, 201)
+        second_token = self.raw_token_of_last_invite()
+        self.assertNotEqual(first_token, second_token)
+
+        # A second row, not an update in place.
+        self.assertNotEqual(response.json()["id"], first_id)
+        self.assertEqual(Invitation.objects.count(), 2)
+        self.assertEqual(
+            Invitation.objects.get(pk=first_id).status, InvitationStatus.REVOKED
+        )
+        # Same membership throughout — the person was always joining.
+        self.assertEqual(
+            Invitation.objects.values_list("membership_id", flat=True).distinct().count(), 1
+        )
+
+        self.client.logout()
+        self.assertEqual(self.client.get(f"/api/invitations/{first_token}/").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/invitations/{second_token}/").status_code, 200)
+
+    def test_an_expired_invitation_can_be_resent(self):
+        """The ordinary reason somebody asks for a new link."""
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        invitation = Invitation.objects.get()
+        invitation.expires_at = timezone.now() - timedelta(seconds=1)
+        invitation.save(update_fields=["expires_at"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/schools/st-marys/invitations/{created.json()['id']}/resend/"
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.client.logout()
+        self.assertEqual(
+            self.client.get(f"/api/invitations/{self.raw_token_of_last_invite()}/").status_code,
+            200,
+        )
+
+    def test_an_accepted_invitation_cannot_be_resent(self):
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        token = self.raw_token_of_last_invite()
+        self.client.post(
+            f"/api/invitations/{token}/accept/",
+            data={"password": "a-brand-new-password"},
+            content_type="application/json",
+        )
+
+        response = self.client.post(
+            f"/api/schools/st-marys/invitations/{created.json()['id']}/resend/"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(Invitation.objects.count(), 1, "no new row was minted")
+
+    def test_resending_requires_authority_at_that_school(self):
+        operator = User.objects.create_user(
+            "ops@luffy.school", PASSWORD, full_name="Ops", is_platform_staff=True
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            elsewhere, _ = invitation_service.invite_staff(
+                operator,
+                self.grace,
+                Role.TEACHER,
+                email="grace.teacher@example.com",
+                full_name="Grace Teacher",
+                accept_url_for=lambda token: f"https://portal/i/{token}/",
+            )
+
+        self.client.force_login(self.admin)
+        # Scoped by the path, so St Mary's admin cannot reach it by id at all.
+        self.assertEqual(
+            self.client.post(
+                f"/api/schools/st-marys/invitations/{elsewhere.pk}/resend/"
+            ).status_code,
+            404,
+        )
+        # ...and naming the right school does not help either.
+        self.assertEqual(
+            self.client.post(
+                f"/api/schools/grace/invitations/{elsewhere.pk}/resend/"
+            ).status_code,
+            403,
+        )
+        self.assertEqual(Invitation.objects.count(), 1)
+
+    def test_resending_requires_a_signed_in_caller(self):
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        self.client.logout()
+
+        response = self.client.post(
+            f"/api/schools/st-marys/invitations/{created.json()['id']}/resend/"
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_the_resend_response_never_carries_the_token(self):
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/schools/st-marys/invitations/{created.json()['id']}/resend/"
+            )
+        self.assertNotIn(self.raw_token_of_last_invite(), response.content.decode())
+
     # -- POST /api/schools/{slug}/invitations/{id}/revoke/ --------------------
 
     def test_an_admin_can_revoke_a_pending_invitation(self):

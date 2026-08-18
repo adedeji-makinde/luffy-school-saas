@@ -34,6 +34,10 @@ class AmbiguousInvitee(InvitationError):
     """The contact details given point at more than one existing person."""
 
 
+class AlreadyAccepted(InvitationError):
+    """Nothing left to resend — the invitee is already in."""
+
+
 def resolve_invitee(*, email=None, phone=None, full_name="", username=None):
     """Find the `User` this invite is for, creating one only if there is none.
 
@@ -133,8 +137,15 @@ def resend_invitation(actor, invitation, *, ttl=None, accept_url_for=None):
     link stops working the moment the new one is minted and the audit trail
     keeps both. That is also why nothing here is unique per person: a resend is
     a second row by design.
+
+    Revoked and expired invitations may be resent — a link going stale is the
+    ordinary reason somebody asks for another. An accepted one may not: the
+    person is already in, and minting a fresh token against a live membership
+    would put a working credential for an active account in an inbox.
     """
     _require_grant_authority(actor, invitation.school)
+    if invitation.status == InvitationStatus.ACCEPTED:
+        raise AlreadyAccepted("That invitation has already been accepted.")
     if invitation.status == InvitationStatus.PENDING:
         invitation.revoke()
 

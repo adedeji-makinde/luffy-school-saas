@@ -1,8 +1,8 @@
 """HTTP surface for the staff invitation flow.
 
-Four endpoints, in two halves that differ in who is on the other end.
+Five endpoints, in two halves that differ in who is on the other end.
 
-The two `/api/schools/{slug}/...` routes are administrative and authenticated:
+The three `/api/schools/{slug}/...` routes are administrative and authenticated:
 a signed-in person acting at a school they hold authority at. Authority is not
 re-implemented here — `invitations.py` calls the same
 `_require_grant_authority()` every other membership write goes through, so an
@@ -28,7 +28,13 @@ from ninja.security import django_auth
 from accounts.services import NotPermitted
 from schools import invitations as invitation_service
 from schools.delivery import NoDeliveryAddress
-from schools.models import Invitation, InvitationError, PasswordRequired, School
+from schools.models import (
+    Invitation,
+    InvitationError,
+    InvitationStatus,
+    PasswordRequired,
+    School,
+)
 
 api = NinjaAPI(title="Luffy School API", version="1.0.0")
 
@@ -121,6 +127,45 @@ def create_invitation(request, slug: str, payload: InviteIn):
     except (invitation_service.InvitationError, NoDeliveryAddress) as exc:
         raise HttpError(400, str(exc))
     return 201, InvitationOut.of(invitation)
+
+
+@api.post(
+    "/schools/{slug}/invitations/{invitation_id}/resend/",
+    response={201: InvitationOut},
+    auth=django_auth,
+    tags=["invitations"],
+)
+def resend_invitation(request, slug: str, invitation_id: int):
+    """Issue a fresh token and kill the old one.
+
+    201 rather than 200, and the response carries a **new** id: a resend is a
+    second row, not an update in place. That is what makes the previous link
+    die the instant this one is minted, and it keeps both in the audit trail.
+    Revoked and expired invitations may be resent — a link going stale is the
+    ordinary reason somebody asks for another; an accepted one may not, which
+    `resend_invitation()` enforces so a non-HTTP caller cannot get past it.
+    """
+    school = get_object_or_404(School, slug=slug)
+    invitation = get_object_or_404(
+        Invitation.objects.select_related("membership__school", "membership__user"),
+        pk=invitation_id,
+        membership__school=school,
+    )
+    try:
+        fresh, _raw_token = invitation_service.resend_invitation(
+            request.user,
+            invitation,
+            accept_url_for=lambda token: request.build_absolute_uri(
+                f"/invitations/{token}/"
+            ),
+        )
+    except NotPermitted as exc:
+        raise HttpError(403, str(exc))
+    except invitation_service.AlreadyAccepted as exc:
+        raise HttpError(409, str(exc))
+    except NoDeliveryAddress as exc:
+        raise HttpError(400, str(exc))
+    return 201, InvitationOut.of(fresh)
 
 
 @api.post(
