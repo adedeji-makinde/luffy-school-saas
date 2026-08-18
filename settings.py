@@ -32,9 +32,10 @@ SHARED_APPS = [
 ]
 
 TENANT_APPS = [
-    # Nothing school-owned exists yet. Academics, attendance, fees and
-    # report cards land here — each school gets its own tables.
+    # Each school gets its own copy of these tables, in its own schema.
+    # Attendance, fees and report cards land here alongside academics.
     "django.contrib.contenttypes",
+    "academics",
 ]
 
 INSTALLED_APPS = SHARED_APPS + [app for app in TENANT_APPS if app not in SHARED_APPS]
