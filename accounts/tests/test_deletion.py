@@ -20,8 +20,13 @@ from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import IntegrityError, connection, models, transaction
 from django.test import TestCase
 
+from django_tenants.utils import schema_exists
+
 from accounts import deletion
 from accounts.deletion import (
+    NoTenantSchema,
+    _deletion_schema,
+    _relations_into_user,
     _sanctioned_delete,
     deactivate_user,
     find_references,
@@ -29,6 +34,7 @@ from accounts.deletion import (
     reactivate_user,
 )
 from accounts.models import Membership, Role, User
+from schools.models import School
 from schools.tests.test_tenant_isolation import (
     PASSWORD,
     connected_to,
@@ -332,6 +338,48 @@ class HardDeleteGuardTests(TestCase):
         self.assertNotIn("\n", "".join(messages))
         self.assertIn("grace: academics.DeletionProbe (1 row)", messages)
         self.assertIn("st_marys: academics.DeletionProbe (1 row)", messages)
+
+    # -- School rows whose schema was never created ---------------------------
+
+    def test_a_school_with_no_real_schema_does_not_break_the_scan(self):
+        """A School row is not proof of a schema.
+
+        `auto_create_schema = False` writes the row and creates nothing, which
+        test_membership.py does routinely. Postgres accepts `SET search_path` to
+        a schema that does not exist, so this used to surface one query later as
+        a ProgrammingError from a function documented to raise ValidationError.
+        """
+        phantom = School(name="Never Provisioned", slug="never", schema_name="aaa_never")
+        phantom.auto_create_schema = False  # row only; no CREATE SCHEMA
+        phantom.save()
+        self.assertFalse(schema_exists("aaa_never"))
+
+        # Scans clean rather than raising: a schema with no tables has no rows.
+        self.assertEqual(find_references(self.user), [])
+        hard_delete_user(self.user)
+        self.assertFalse(User.objects.filter(pk=self.user.pk).exists())
+
+    def test_the_delete_never_runs_in_a_schema_that_does_not_exist(self):
+        """`aaa_never` sorts first; picking it would fail on a missing relation."""
+        phantom = School(name="Never Provisioned", slug="never", schema_name="aaa_never")
+        phantom.auto_create_schema = False
+        phantom.save()
+
+        _, tenant_local = _relations_into_user()
+        self.assertTrue(tenant_local, "probe models should be registered here")
+        self.assertEqual(_deletion_schema(tenant_local), "grace")
+
+    def test_it_says_so_when_no_school_schema_exists_at_all(self):
+        """Correctly typed, not a ProgrammingError leaked from two layers down."""
+        School.objects.all().delete()
+        phantom = School(name="Never Provisioned", slug="never", schema_name="aaa_never")
+        phantom.auto_create_schema = False
+        phantom.save()
+
+        _, tenant_local = _relations_into_user()
+        with self.assertRaises(NoTenantSchema) as caught:
+            _deletion_schema(tenant_local)
+        self.assertIn("auto_create_schema=False", str(caught.exception))
 
     # -- an app the scan cannot place ----------------------------------------
 

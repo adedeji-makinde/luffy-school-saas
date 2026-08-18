@@ -1,0 +1,61 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The suite is not runnable without a real Postgres, and deliberately so:
+    # schools/tests/test_tenant_isolation.py asserts against pg_namespace,
+    # pg_tables and pg_constraint, and every make_school() issues a real
+    # CREATE SCHEMA followed by a real migrate_schemas run. SQLite or a mocked
+    # backend would turn the isolation proof into a tautology.
+    services:
+      postgres:
+        # Matched to docker-compose.yml so CI and the devcontainer agree.
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: luffy_db
+          POSTGRES_USER: luffy_admin
+          POSTGRES_PASSWORD: changeme
+        ports:
+          - 5432:5432
+        # Without this the first migration can land before Postgres is
+        # accepting connections, which fails as a confusing OperationalError.
+        options: >-
+          --health-cmd "pg_isready -U luffy_admin -d luffy_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_DB: luffy_db
+      POSTGRES_USER: luffy_admin
+      POSTGRES_PASSWORD: changeme
+      # Not "db": the service is published on the runner's own network here,
+      # unlike docker-compose where it is reachable by service name.
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      # Catches a model edited without its migration, which the test suite
+      # would otherwise sail past — the test database is built from the models.
+      - name: Check for missing migrations
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run tests
+        run: python manage.py test --verbosity 2

@@ -56,9 +56,20 @@ from django_tenants.utils import (
     get_public_schema_name,
     get_tenant_model,
     schema_context,
+    schema_exists,
 )
 
 from .models import User
+
+
+class NoTenantSchema(Exception):
+    """A delete needs a school schema to run in and there is not one.
+
+    Its own type rather than `ValidationError`, because it is not a statement
+    about the user being deleted — nothing is wrong with them. It says the
+    platform is in a state this module cannot safely act in, which is a
+    different problem with a different fix.
+    """
 
 #: Which schema a model's table actually lives in, by app. An app listed in
 #: both settings gets a table in `public` *and* in every tenant schema, so it
@@ -219,13 +230,44 @@ def _count_references(user, relations, schema_name):
     return found
 
 
+def _tenant_schema_names():
+    """Every school schema that genuinely exists in Postgres, in a stable order.
+
+    A `School` row is not proof of a schema. `auto_create_schema = False` writes
+    the row and creates nothing — `accounts/tests/test_membership.py` does this
+    routinely — and a half-finished provision leaves the same state. Postgres
+    accepts `SET search_path` to a schema that does not exist without complaint,
+    so the mistake only surfaces one query later as `ProgrammingError: relation
+    "..." does not exist`, from a module that promises `ValidationError`.
+
+    Excluded rather than raising, and the distinction matters: a schema that does
+    not exist has no tables, so it holds no rows, so it cannot hold a reference —
+    ruling it out is a fact, not a guess. That is not true of a schema that
+    exists but whose table is missing, which still raises (see `find_references`),
+    because there the scan really would be guessing.
+
+    Ordering is explicit so the schema `_deletion_schema()` settles on is stable
+    between calls rather than whatever order Postgres feels like returning.
+    """
+    public_schema = get_public_schema_name()
+    schema_names = (
+        get_tenant_model()
+        .objects.exclude(schema_name=public_schema)
+        .order_by("schema_name")
+        .values_list("schema_name", flat=True)
+    )
+    return [name for name in schema_names if schema_exists(name)]
+
+
 def find_references(user):
     """Everything anywhere that still points at `user`.
 
     Visits `public` once for shared models, then every school's schema for
-    tenant-local ones. A missing tenant table raises rather than being skipped:
-    a schema this scan cannot read is a schema whose references it cannot rule
-    out, and guessing "none" there is the failure this module exists to prevent.
+    tenant-local ones. A missing tenant table in a schema that *does* exist
+    raises rather than being skipped: that is a schema whose references cannot
+    be ruled out, and guessing "none" there is the failure this module exists to
+    prevent. A schema that does not exist at all is a different case and is
+    excluded up front — see `_tenant_schema_names()`.
     """
     shared, tenant_local = _relations_into_user()
     public_schema = get_public_schema_name()
@@ -234,13 +276,7 @@ def find_references(user):
         found = _count_references(user, shared, public_schema)
 
     if tenant_local:
-        schema_names = (
-            get_tenant_model()
-            .objects.exclude(schema_name=public_schema)
-            .order_by("schema_name")
-            .values_list("schema_name", flat=True)
-        )
-        for schema_name in schema_names:
+        for schema_name in _tenant_schema_names():
             with schema_context(schema_name):
                 found.extend(_count_references(user, tenant_local, schema_name))
 
@@ -262,18 +298,28 @@ def _deletion_schema(tenant_local_relations):
     established there is nothing to collect in any of them. With no tenant
     models pointing here — which is where this codebase stands today — `public`
     is both sufficient and the honest answer.
+
+    It must be a schema that exists. Handing back the name of one that does not
+    puts the failure two steps away from its cause: the `SET search_path`
+    succeeds silently and the delete dies on a missing relation, so a caller
+    catching `ValidationError` gets a `ProgrammingError` instead. Only real
+    schemas are candidates, and if a tenant model needs one and there is none,
+    that is said plainly rather than discovered later.
     """
     public_schema = get_public_schema_name()
     if not tenant_local_relations:
         return public_schema
-    schema_name = (
-        get_tenant_model()
-        .objects.exclude(schema_name=public_schema)
-        .order_by("schema_name")
-        .values_list("schema_name", flat=True)
-        .first()
-    )
-    return schema_name or public_schema
+
+    schema_names = _tenant_schema_names()
+    if not schema_names:
+        raise NoTenantSchema(
+            f"{len(tenant_local_relations)} tenant-scoped relation(s) point at "
+            "accounts.User, so this delete has to run inside a school schema for "
+            "their tables to resolve — and no school schema exists. Either the "
+            "School rows were saved with auto_create_schema=False, or their "
+            "schemas were never created."
+        )
+    return schema_names[0]
 
 
 @transaction.atomic
