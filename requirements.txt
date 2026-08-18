@@ -2,3 +2,4 @@ Django>=5.0
 psycopg2-binary>=2.9
 django-tenants>=3.6
 phonenumbers>=8.13
+django-ninja>=1.6

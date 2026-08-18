@@ -299,11 +299,55 @@ Rejected on principle: destination-only authority. It would let a receiving scho
 unilaterally end a membership at a school it has no relationship with, which is exactly
 the cross-school write this model exists to prevent.
 
-**2. No invitation flow.** Nothing sets `invited` except an explicit `status=` argument —
-no tokens, no email, no acceptance step. When it is built, remember that identity is
-global, so the two states are orthogonal: whether the *person* has a usable credential
-(`User`-level) and whether *this school's* relationship has been accepted
-(`Membership`-level). A parent invited to a second school may already have a full account
-with a password, and a flow assuming "invite ⇒ create account" would break that case —
-which is the case this model exists to serve. `create_user(username, None)` yields an
-unusable password and cannot authenticate, which is the natural placeholder.
+**2. ~~No invitation flow.~~ Built for staff; parents and students still open.**
+See [Inviting staff](#inviting-staff) below. The warning this item carried turned out to
+be the load-bearing part of the design and survives intact: identity is global, so the
+two states are orthogonal — whether the *person* has a usable credential (`User`-level)
+and whether *this school's* relationship has been accepted (`Membership`-level).
+`Invitation.needs_password` is exactly that distinction, and the preview endpoint reports
+it so a teacher joining their second school is never asked for a second password.
+
+What remains open is the other half of the audience: parents and students. That is not
+the same flow with a different role value. Parents commonly share one phone between two
+guardians, students often have neither email nor phone, and both need a channel that is
+not email — which is why delivery is a seam rather than a method (see below).
+
+## Inviting staff
+
+An admin invites by email or phone plus an intended role. The person is resolved through
+`User.objects.matching_identifier()` — the same lookup sign-in uses, so an invite can
+never find somebody a later login would not — and an existing account is **reused**, not
+duplicated. Only if there is no match at all is a placeholder created with
+`create_user(username, None)`, whose unusable password cannot authenticate until
+acceptance sets one.
+
+The `Membership` is created immediately at `INVITED`. That is a real relationship which
+grants no access: it appears on `services.school_directory()` and is absent from
+`invitations.active_staff()`. Acceptance promotes it to `ACTIVE`. So an `Invitation` is a
+credential for a relationship that already exists in the data, not a promise of one —
+which is why it holds a single foreign key to the membership rather than repeating the
+person, school and role as three columns that could drift.
+
+**Tokens are stored as SHA-256 digests and never in the clear**, on the same reasoning as
+a password: whoever can read the table cannot mint a working link from it, so a leaked
+backup is not a set of live invitations. `create_with_token()` returns the raw token to
+its caller once; after that it exists only in whatever the recipient received. A lost
+token is reissued, never recovered.
+
+`validate_token()` answers `None` for unknown, spent, revoked and expired alike, and the
+endpoints turn all four into the same 404 — telling a guesser that a token was *once*
+real is telling them they guessed a real one. Expiry is settled lazily on lookup rather
+than by a scheduled job, so a row cannot sit in `pending` past its date because a cron
+job is broken.
+
+A resend revokes the old invitation and issues a second row rather than updating one in
+place, so the previous link dies the moment the new one is minted and both stay in the
+audit trail. Nothing is unique but `token_hash` — deliberately no "one invitation per
+person" or per contact detail, because a shared phone number must not collide.
+
+**Delivery is a seam, not a method.** `schools/delivery.py` defines a channel as anything
+with `send(invitation, raw_token, *, accept_url)`, resolved from `INVITATION_CHANNEL`.
+`schools/models.py` does not import it and a test enforces that. Adding WhatsApp for
+parents is a new class beside `EmailChannel` and a settings value — not an edit to
+`Invitation`. Sending is dispatched through `transaction.on_commit`, so no link is ever
+delivered for an invitation whose transaction rolled back.

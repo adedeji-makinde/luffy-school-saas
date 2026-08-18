@@ -1,5 +1,43 @@
-from django.db import models
+"""The tenant itself, and the invitations that bring people into one.
+
+`School` and `Domain` are django_tenants plumbing. `Invitation` is here for a
+less obvious reason: it lives in the **public** schema, like `Membership` and
+for the same cause. An invitation is a (person, school, role) triple, and the
+person half is global — a teacher at St Mary's invited to Grace Academy is one
+`accounts.User` gaining a second `Membership`, not a new account. A per-school
+invitations table could not express that without reaching across schemas, which
+is the pattern `docs/tenancy.md` still blocks.
+
+Being shared is also what lets the foreign keys below be real foreign keys,
+with real referential integrity, exactly as `Membership.user` is.
+"""
+
+import hashlib
+import secrets
+from datetime import timedelta
+
+from django.db import models, transaction
+from django.utils import timezone
 from django_tenants.models import DomainMixin, TenantMixin
+
+
+class InvitationError(Exception):
+    """An invitation was redeemed or cancelled in a state that does not allow it."""
+
+
+class PasswordRequired(InvitationError):
+    """Accepting needs a password because the invitee has no usable one yet.
+
+    Its own type so a caller can tell "you must choose a password" — which the
+    invitee can act on — apart from "this link is spent", which they cannot.
+    """
+
+#: How long an invite link stays good for. Long enough to survive a weekend and
+#: a forwarded email; short enough that a leaked link goes stale on its own.
+DEFAULT_INVITATION_TTL = timedelta(days=7)
+
+#: Bytes of entropy behind each token, before urlsafe-base64 expands it.
+TOKEN_BYTES = 32
 
 
 class School(TenantMixin):
@@ -30,3 +68,228 @@ class Domain(DomainMixin):
     """Hostname a school is reached on, e.g. stmarys.luffy.school."""
 
     pass
+
+
+def hash_token(raw_token: str) -> str:
+    """The only representation of a token this system is allowed to keep."""
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+class InvitationStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    ACCEPTED = "accepted", "Accepted"
+    EXPIRED = "expired", "Expired"
+    REVOKED = "revoked", "Revoked"
+
+
+class InvitationQuerySet(models.QuerySet):
+    def pending(self):
+        return self.filter(status=InvitationStatus.PENDING)
+
+    def for_school(self, school):
+        return self.filter(membership__school=school)
+
+
+class Invitation(models.Model):
+    """A pending offer of a role at a school, and the token that redeems it.
+
+    Points at the `Membership` rather than repeating the person, the school and
+    the role as three columns of its own. That one foreign key already pins all
+    three, and it cannot drift out of step with the membership it is supposed to
+    activate — which three loose columns could. `user`, `school` and
+    `intended_role` below read them back off it.
+
+    The membership exists first, at `INVITED`, and acceptance moves it to
+    `ACTIVE`. So the invitation is a *credential* for a relationship that
+    already exists in the data, not a promise of one to be created later.
+
+    Nothing here is unique but `token_hash`. In particular there is deliberately
+    no "one invitation per person" or per contact detail: a resend issues a
+    second row, and a phone number shared between two people (a household with
+    one handset — the case that arrives with parents) must not collide.
+    """
+
+    membership = models.ForeignKey(
+        "accounts.Membership",
+        related_name="invitations",
+        on_delete=models.PROTECT,
+        help_text="The INVITED membership this token activates.",
+    )
+    invited_by = models.ForeignKey(
+        "accounts.User", related_name="invitations_sent", on_delete=models.PROTECT
+    )
+
+    # Only ever the SHA-256 of the token, never the token. Same reasoning as a
+    # password digest: whoever can read this table still cannot mint a working
+    # link from it. A leaked backup is not a set of live invitations.
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+
+    status = models.CharField(
+        max_length=16, choices=InvitationStatus, default=InvitationStatus.PENDING
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    accepted_at = models.DateTimeField(null=True, blank=True)
+
+    objects = InvitationQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["membership", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_status_display()} invitation for {self.membership}"
+
+    # -- read the triple back off the membership -----------------------------
+
+    @property
+    def user(self):
+        return self.membership.user
+
+    @property
+    def school(self):
+        return self.membership.school
+
+    @property
+    def intended_role(self) -> str:
+        return self.membership.role
+
+    @property
+    def is_expired(self) -> bool:
+        return timezone.now() >= self.expires_at
+
+    @property
+    def needs_password(self) -> bool:
+        """Whether accepting this has to set a password.
+
+        The question is about the *person*, not this school: someone who already
+        signs in somewhere else keeps the password they have. This is the
+        `User`-level half of the two orthogonal states in docs/membership.md,
+        and it is what the preview endpoint reports so the form knows whether to
+        show a password field at all.
+        """
+        return not self.membership.user.has_usable_password()
+
+    # -- minting and redeeming -----------------------------------------------
+
+    @classmethod
+    def create_with_token(cls, membership, invited_by, *, ttl=DEFAULT_INVITATION_TTL):
+        """Create an invitation and return `(invitation, raw_token)`.
+
+        The raw token is returned and never stored. It exists in memory for as
+        long as it takes a delivery channel to put it in a link, and after that
+        only in whatever the recipient received — so a lost token is reissued,
+        never recovered.
+        """
+        raw_token = secrets.token_urlsafe(TOKEN_BYTES)
+        invitation = cls.objects.create(
+            membership=membership,
+            invited_by=invited_by,
+            token_hash=hash_token(raw_token),
+            expires_at=timezone.now() + ttl,
+        )
+        return invitation, raw_token
+
+    @classmethod
+    def validate_token(cls, raw_token):
+        """The pending invitation `raw_token` redeems, or None.
+
+        Returns None for a token that is unknown, already used, revoked, or past
+        its expiry — the caller cannot tell which, and should not: distinguishing
+        "no such invitation" from "that one is spent" tells an attacker holding a
+        guessed token whether they guessed a real one.
+
+        Expiry is settled here rather than by a scheduled job. An invitation is
+        only ever looked at when someone presents its token, so the lazy sweep
+        is enough, and it means a row cannot sit in PENDING past its date while
+        a cron job is broken.
+        """
+        if not raw_token:
+            return None
+        invitation = (
+            cls.objects.select_related("membership__user", "membership__school")
+            .filter(token_hash=hash_token(raw_token), status=InvitationStatus.PENDING)
+            .first()
+        )
+        if invitation is None:
+            return None
+        if invitation.is_expired:
+            invitation.status = InvitationStatus.EXPIRED
+            invitation.save(update_fields=["status"])
+            return None
+        return invitation
+
+    @transaction.atomic
+    def accept(self, password=None):
+        """Redeem this invitation. Returns the now-active `Membership`.
+
+        Two states move, and they are not the same state — which is the whole
+        reason this method is careful. The *person* may or may not already have
+        a usable credential; *this school's* relationship goes from INVITED to
+        ACTIVE regardless. A teacher accepting their second school has a
+        password already and must not be asked for another; a brand-new hire has
+        the unusable placeholder from `create_user(username, None)` and has to
+        set one now.
+
+        `has_usable_password()` is the test rather than "is this their first
+        membership", because the two can disagree: someone can hold a membership
+        and still have never set a password.
+        """
+        if self.status != InvitationStatus.PENDING:
+            raise InvitationError(f"This invitation is {self.get_status_display().lower()}.")
+        if self.is_expired:
+            self.status = InvitationStatus.EXPIRED
+            self.save(update_fields=["status"])
+            raise InvitationError("This invitation has expired.")
+
+        # Imported here, not at module scope. `schools` is loaded before
+        # `accounts` (see SHARED_APPS), so importing accounts.models while this
+        # module is being read would ask for an app registry that is still
+        # filling. The foreign keys above use string references for the same
+        # reason and never need the class at import time.
+        from accounts.models import MembershipStatus, User
+
+        # select_for_update: two clicks on the same link should not both run
+        # this. The loser finds the row no longer PENDING and is refused above.
+        user = User.objects.select_for_update().get(pk=self.membership.user_id)
+
+        if not user.has_usable_password():
+            if not password:
+                raise PasswordRequired(
+                    "This is your first sign-in, so a password is required."
+                )
+            user.set_password(password)
+            user.save(update_fields=["password"])
+        # ...and if they already have one, `password` is ignored rather than
+        # rejected: the form had no reason to send it, but a client that does
+        # must not be able to silently reset an existing account's credential
+        # through an invite link.
+
+        membership = self.membership
+        if membership.status == MembershipStatus.INVITED:
+            membership.status = MembershipStatus.ACTIVE
+            membership.save(update_fields=["status", "updated_at"])
+
+        self.status = InvitationStatus.ACCEPTED
+        self.accepted_at = timezone.now()
+        self.save(update_fields=["status", "accepted_at"])
+        return membership
+
+    def revoke(self):
+        """Cancel a pending invitation. Its token stops working immediately.
+
+        Leaves the INVITED membership alone. Revoking an invite is "that link is
+        dead", not "this person is not joining" — a resend issues a new token
+        against the same membership, which is exactly why the two are separate.
+        `end_membership` on the service side is the other decision.
+        """
+        if self.status != InvitationStatus.PENDING:
+            raise InvitationError(
+                f"Only a pending invitation can be revoked; this one is "
+                f"{self.get_status_display().lower()}."
+            )
+        self.status = InvitationStatus.REVOKED
+        self.save(update_fields=["status"])
+        return self

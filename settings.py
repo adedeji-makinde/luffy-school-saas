@@ -68,6 +68,22 @@ PHONE_DEFAULT_REGION = os.environ.get("PHONE_DEFAULT_REGION", "NG")
 
 ROOT_URLCONF = "urls"
 
+# ---------------------------------------------------------------------------
+# Invitations
+#
+# The channel is a dotted path rather than a hard-coded class so that adding
+# WhatsApp for parents later is a settings change and a new class beside
+# EmailChannel, not an edit to the Invitation model. See schools/delivery.py.
+# ---------------------------------------------------------------------------
+INVITATION_CHANNEL = os.environ.get(
+    "INVITATION_CHANNEL", "schools.delivery.EmailChannel"
+)
+
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
+)
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@luffy.school")
+
 DATABASES = {
     "default": {
         "ENGINE": "django_tenants.postgresql_backend",

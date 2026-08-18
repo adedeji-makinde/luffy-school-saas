@@ -1,0 +1,188 @@
+"""HTTP surface for the staff invitation flow.
+
+Four endpoints, in two halves that differ in who is on the other end.
+
+The two `/api/schools/{slug}/...` routes are administrative and authenticated:
+a signed-in person acting at a school they hold authority at. Authority is not
+re-implemented here — `invitations.py` calls the same
+`_require_grant_authority()` every other membership write goes through, so an
+admin's reach stops at their own school in exactly the same way.
+
+The two `/api/invitations/{token}/` routes are the opposite: the caller is not
+signed in and by definition cannot be, because the whole point of the flow is
+that they may not have a usable password yet. The token *is* the credential.
+Both are therefore unauthenticated, both look their invitation up through
+`Invitation.validate_token()`, and both answer a bad token with a flat 404 —
+never "expired" versus "revoked" versus "no such thing", which would tell
+somebody testing guessed tokens which of them were real.
+"""
+
+from typing import Optional
+
+from django.http import Http404
+from django.shortcuts import get_object_or_404
+from ninja import NinjaAPI, Schema
+from ninja.errors import HttpError
+from ninja.security import django_auth
+
+from accounts.services import NotPermitted
+from schools import invitations as invitation_service
+from schools.delivery import NoDeliveryAddress
+from schools.models import Invitation, InvitationError, PasswordRequired, School
+
+api = NinjaAPI(title="Luffy School API", version="1.0.0")
+
+
+# -- request and response shapes ---------------------------------------------
+
+
+class InviteIn(Schema):
+    role: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    full_name: str = ""
+
+
+class InvitationOut(Schema):
+    id: int
+    status: str
+    role: str
+    school: str
+    invitee: str
+    expires_at: str
+
+    @staticmethod
+    def of(invitation) -> "InvitationOut":
+        return InvitationOut(
+            id=invitation.pk,
+            status=invitation.status,
+            role=invitation.intended_role,
+            school=invitation.school.name,
+            invitee=invitation.user.full_name or invitation.user.username,
+            expires_at=invitation.expires_at.isoformat(),
+        )
+
+
+class PreviewOut(Schema):
+    """What the invitee is shown before they commit to anything.
+
+    `needs_password` is the whole reason this endpoint exists. It is a question
+    about the *person*, not this school: somebody who already signs in elsewhere
+    keeps their password, and asking them to choose a second one would be both
+    confusing and wrong. The form renders a password field if and only if this
+    is true, and `/accept/` enforces the same rule server-side.
+    """
+
+    school: str
+    role: str
+    invitee: str
+    needs_password: bool
+    expires_at: str
+
+
+class AcceptIn(Schema):
+    password: Optional[str] = None
+
+
+class AcceptedOut(Schema):
+    school: str
+    role: str
+    status: str
+
+
+# -- administrative: issuing and cancelling ----------------------------------
+
+
+@api.post(
+    "/schools/{slug}/invitations/",
+    response={201: InvitationOut},
+    auth=django_auth,
+    tags=["invitations"],
+)
+def create_invitation(request, slug: str, payload: InviteIn):
+    school = get_object_or_404(School, slug=slug)
+    try:
+        invitation, _raw_token = invitation_service.invite_staff(
+            request.user,
+            school,
+            payload.role,
+            email=payload.email,
+            phone=payload.phone,
+            full_name=payload.full_name,
+            # The link the invitee clicks. A frontend route, not this API —
+            # the token is handed to the channel and never returned in the
+            # response, so an admin cannot read it back out of the API either.
+            accept_url_for=lambda token: request.build_absolute_uri(
+                f"/invitations/{token}/"
+            ),
+        )
+    except NotPermitted as exc:
+        raise HttpError(403, str(exc))
+    except (invitation_service.InvitationError, NoDeliveryAddress) as exc:
+        raise HttpError(400, str(exc))
+    return 201, InvitationOut.of(invitation)
+
+
+@api.post(
+    "/schools/{slug}/invitations/{invitation_id}/revoke/",
+    response=InvitationOut,
+    auth=django_auth,
+    tags=["invitations"],
+)
+def revoke_invitation(request, slug: str, invitation_id: int):
+    school = get_object_or_404(School, slug=slug)
+    invitation = get_object_or_404(
+        Invitation.objects.select_related("membership__school", "membership__user"),
+        pk=invitation_id,
+        membership__school=school,
+    )
+    try:
+        invitation_service.revoke_invitation(request.user, invitation)
+    except NotPermitted as exc:
+        raise HttpError(403, str(exc))
+    except InvitationError as exc:
+        raise HttpError(409, str(exc))
+    return InvitationOut.of(invitation)
+
+
+# -- the invitee's half, unauthenticated -------------------------------------
+
+
+def _validated(token: str):
+    invitation = Invitation.validate_token(token)
+    if invitation is None:
+        # One answer for unknown, spent, revoked and expired alike.
+        raise Http404("No such invitation.")
+    return invitation
+
+
+@api.get("/invitations/{token}/", response=PreviewOut, auth=None, tags=["invitations"])
+def preview_invitation(request, token: str):
+    invitation = _validated(token)
+    return PreviewOut(
+        school=invitation.school.name,
+        role=invitation.membership.get_role_display(),
+        invitee=invitation.user.full_name or invitation.user.username,
+        needs_password=invitation.needs_password,
+        expires_at=invitation.expires_at.isoformat(),
+    )
+
+
+@api.post(
+    "/invitations/{token}/accept/", response=AcceptedOut, auth=None, tags=["invitations"]
+)
+def accept_invitation(request, token: str, payload: AcceptIn):
+    invitation = _validated(token)
+    try:
+        membership = invitation.accept(password=payload.password)
+    except PasswordRequired as exc:
+        # 422 rather than 400: the request was well formed and the token is
+        # good, but a field the preview asked for is missing.
+        raise HttpError(422, str(exc))
+    except InvitationError as exc:
+        raise HttpError(409, str(exc))
+    return AcceptedOut(
+        school=membership.school.name,
+        role=membership.role,
+        status=membership.status,
+    )
