@@ -264,3 +264,40 @@ The three options, with what each actually buys:
 
 Whoever picks up the next tenant-scoped model decides this first, and records
 the decision here.
+
+### Half of option 3 now exists
+
+`accounts/deletion.py` is the deletion path that iterates every schema. **This
+does not decide the policy** — the blocker above still stands and no tenant model
+may add a `ForeignKey` to `accounts` until someone chooses. It removes the
+machinery from the cost of choosing, and it earns its place today regardless:
+`Membership.user` is already `CASCADE`, so before this a plain `user.delete()`
+silently took a person's memberships with it.
+
+`hard_delete_user()` scans for references and refuses if it finds any, listing
+the schemas. Two things learned while writing it, both easy to get wrong:
+
+**Shared models must be counted once, in `public` — not once per schema.**
+`schema_context` sets the `search_path` to `<tenant>, public`, so an unqualified
+query for a shared table from inside a tenant reads the one public table again:
+
+```
+schema='grace'    search_path='grace, public' membership_count=1
+schema='st_marys' search_path='st_marys, public' membership_count=1
+public count: 1
+```
+
+That is one membership, at St Mary's, reported by both schools. A scan that
+looped over schemas looking for `Membership` would name every school on the
+platform as an offender for a user who belongs to one of them. So the scan
+splits relations by where the table actually lives: `SHARED_APPS` once in
+`public`, `TENANT_APPS` once per school.
+
+**The delete itself cannot run from `public`** once any tenant model references
+`User`. The collector walks every relation before deleting anything, so each
+referencing table has to resolve on the `search_path` at that moment — and a
+tenant-local table does not exist in `public`. It fails with `relation "..." does
+not exist`: guard passed, delete still broken. Only a tenant's `search_path`
+covers tenant-local and shared tables at once, which is why `_deletion_schema()`
+picks one. Which school is irrelevant — the scan has already proven there is
+nothing to collect in any of them.
