@@ -334,16 +334,55 @@ backup is not a set of live invitations. `create_with_token()` returns the raw t
 its caller once; after that it exists only in whatever the recipient received. A lost
 token is reissued, never recovered.
 
-`validate_token()` answers `None` for unknown, spent, revoked and expired alike, and the
-endpoints turn all four into the same 404 — telling a guesser that a token was *once*
-real is telling them they guessed a real one. Expiry is settled lazily on lookup rather
-than by a scheduled job, so a row cannot sit in `pending` past its date because a cron
-job is broken.
+`validate_token()` answers `None` for unknown, spent, revoked, expired **and
+no-longer-invited** alike, and the endpoints turn all five into the same 404 — telling a
+guesser that a token was *once* real is telling them they guessed a real one. Expiry is
+settled lazily on lookup rather than by a scheduled job, so a row cannot sit in `pending`
+past its date because a cron job is broken.
 
 A resend revokes the old invitation and issues a second row rather than updating one in
 place, so the previous link dies the moment the new one is minted and both stay in the
 audit trail. Nothing is unique but `token_hash` — deliberately no "one invitation per
 person" or per contact detail, because a shared phone number must not collide.
+
+Acceptance is the only path that sets a password, and what it writes is a *global*
+credential — it signs the person in at every school they hold a membership at, not just
+the one that invited them. `AUTH_PASSWORD_VALIDATORS` therefore has to be non-empty for
+that path to mean anything; Django ships it empty. `accept()` calls `validate_password()`
+itself rather than leaving it to the endpoint, and raises `WeakPassword`, which the API
+renders as 422 beside `PasswordRequired` — both are things the invitee can fix and
+resubmit with the same link.
+
+### Every rule is asked of the membership, not of the row
+
+An `Invitation` is a credential for a relationship, so the relationship is what decides
+whether the credential is still good. This is not a stylistic preference; asking the
+invitation row instead is wrong in ways that are easy to miss, because a membership has
+more than one invitation over its life and each row's status describes only itself:
+
+- **A token dies with its membership.** `Membership.end()` and a suspension leave any
+  outstanding invitation `pending`, so `validate_token()` requires the membership to be
+  `INVITED` as well. Without that, a withdrawn relationship left a working link behind —
+  and redeeming it still set that global password. `accept()` re-checks rather than
+  trusting the lookup, because it is callable directly.
+- **A resend asks the membership too.** After `invite → resend → accept`, row one is
+  `REVOKED` and the membership is `ACTIVE`. "Revoked" is a resendable state, so a rule
+  keyed off row one would happily mint a live token for somebody already in — the exact
+  thing the rule exists to prevent. `AlreadyAccepted` (409) is raised off
+  `membership.status`; suspended and ended give `MembershipNotOpen`.
+- **Inviting an existing member is refused.** `grant_membership()` is idempotent and
+  returns a live row *untouched*, so a requested `status=INVITED` is silently dropped
+  against an `ACTIVE` membership. `invite_staff()` checks for a live membership under the
+  same lock `grant_membership()` takes, and raises `AlreadyAMember` (409). An **ended**
+  membership is not in the way — re-hiring revives the row to `INVITED`, which also
+  revives any invitation still pending against it.
+
+The API answers back with none of this. `InvitationOut` deliberately carries no invitee
+name: identity is global, so a matching account may belong to somebody this school has no
+relationship with, and echoing the *resolved* account's name both leaked a stranger's real
+name across schools and made the endpoint an exists/does-not-exist oracle for any email or
+phone on the platform — one unsolicited invitation email per probe. The invitee sees their
+own name on the preview, where the token proves who they are.
 
 **Delivery is a seam, not a method.** `schools/delivery.py` defines a channel as anything
 with `send(invitation, raw_token, *, accept_url)`, resolved from `INVITATION_CHANNEL`.

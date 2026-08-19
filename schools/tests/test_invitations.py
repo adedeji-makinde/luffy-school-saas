@@ -28,6 +28,7 @@ from schools.models import (
     InvitationStatus,
     PasswordRequired,
     School,
+    WeakPassword,
     hash_token,
 )
 
@@ -280,6 +281,173 @@ class TokenLifecycleTests(InvitationSetUp):
             invitation.accept(password="second-time")
 
 
+class MembershipStateGuardTests(InvitationSetUp):
+    """The invitation is a credential for a relationship, so the relationship rules.
+
+    Every case below is one where the *invitation row* looks perfectly fine and
+    the membership behind it does not. Reading each rule off the row instead of
+    off the membership is what let all of them through.
+    """
+
+    def test_a_revoked_sibling_cannot_be_resent_once_the_membership_is_active(self):
+        """The resend rule belongs to the membership, not to the row handed in.
+
+        invite → resend → accept leaves row one REVOKED and the membership
+        ACTIVE. By its own status row one reads as "revoked, therefore
+        resendable", and resending it minted a live token for an account that
+        was already in — the exact outcome `resend_invitation` forbids.
+        """
+        with recording():
+            first, _ = self.invite()
+            _second, second_token = invitation_service.resend_invitation(
+                self.admin, first, accept_url_for=lambda t: f"https://portal/i/{t}/"
+            )
+        Invitation.validate_token(second_token).accept(password="now-i-am-staff")
+
+        first.refresh_from_db()
+        self.assertEqual(first.status, InvitationStatus.REVOKED)
+
+        with self.assertRaises(invitation_service.AlreadyAccepted):
+            invitation_service.resend_invitation(self.admin, first)
+        self.assertEqual(Invitation.objects.count(), 2, "no third row was minted")
+
+    def test_a_suspended_membership_cannot_be_resent_against(self):
+        with recording():
+            invitation, _ = self.invite()
+        Membership.objects.filter(pk=invitation.membership_id).update(
+            status=MembershipStatus.SUSPENDED
+        )
+        invitation.refresh_from_db()
+
+        with self.assertRaises(invitation_service.MembershipNotOpen):
+            invitation_service.resend_invitation(self.admin, invitation)
+
+    def test_ending_the_membership_kills_the_outstanding_token(self):
+        """A withdrawn relationship must not leave a working link behind.
+
+        `Membership.end()` does not touch the invitation, so the row stays
+        PENDING. The token dies anyway, because what `validate_token()` asks is
+        whether the *relationship* is still open — and it answers with the same
+        flat None as any other dead token, since "your membership was ended" is
+        not something a link holder should learn from a link.
+        """
+        with recording():
+            invitation, raw_token = self.invite()
+        invitation.membership.end()
+
+        self.assertIsNone(Invitation.validate_token(raw_token))
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+
+    def test_accepting_against_an_ended_membership_is_refused_directly(self):
+        """Asked again in `accept()`, because `accept()` is callable directly.
+
+        The credential half is the part that matters: without this, redeeming
+        the stale link set a *global* password on the account — a working
+        platform credential handed to somebody whose relationship was withdrawn.
+        """
+        with recording():
+            invitation, _ = self.invite()
+        invitation.membership.end()
+
+        with self.assertRaises(InvitationError):
+            invitation.accept(password="a-brand-new-password")
+
+        user = invitation.membership.user
+        user.refresh_from_db()
+        self.assertFalse(user.has_usable_password())
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+
+    def test_inviting_somebody_who_already_holds_the_role_is_refused(self):
+        """`grant_membership()` is idempotent, which is the trap.
+
+        It returns a live row untouched, so `status=INVITED` was silently
+        dropped: the endpoint answered 201 "pending" while the membership was
+        ACTIVE, and the token minted against it was a working credential for a
+        live account, emailed to somebody already on staff.
+        """
+        kemi = User.objects.create_user(
+            "kemi@example.com",
+            PASSWORD,
+            full_name="Kemi Bello",
+            email="kemi@example.com",
+        )
+        grant_membership(kemi, self.stmarys, Role.TEACHER)
+
+        with recording():
+            with self.assertRaises(invitation_service.AlreadyAMember):
+                self.invite(email="kemi@example.com")
+
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertEqual(
+            Membership.objects.get(
+                user=kemi, school=self.stmarys, role=Role.TEACHER
+            ).status,
+            MembershipStatus.ACTIVE,
+        )
+
+    def test_a_former_member_can_be_invited_back(self):
+        """The guard is about *live* memberships. Re-hiring is a real thing.
+
+        Note the consequence of tying a token's life to its membership: reviving
+        the row to INVITED revives any invitation still pending against it, so
+        the earlier link works again too. Both are the same person, school and
+        role, and both still expire on their own.
+        """
+        with recording():
+            invitation, _ = self.invite()
+        invitation.membership.end()
+
+        with recording():
+            again, token = self.invite()
+
+        self.assertEqual(again.membership_id, invitation.membership_id)
+        self.assertEqual(again.membership.status, MembershipStatus.INVITED)
+        self.assertEqual(Invitation.validate_token(token), again)
+
+
+class PasswordStrengthTests(InvitationSetUp):
+    """`accept()` is the only place that sets a password on somebody's behalf."""
+
+    def test_a_trivially_weak_password_is_refused(self):
+        with recording():
+            invitation, _ = self.invite()
+
+        with self.assertRaises(WeakPassword):
+            invitation.accept(password="short")
+
+        # Nothing moved: not the credential, not the invitation, not the
+        # membership. The invitee can pick a better one and try the same link.
+        user = invitation.membership.user
+        user.refresh_from_db()
+        self.assertFalse(user.has_usable_password())
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+        invitation.membership.refresh_from_db()
+        self.assertEqual(invitation.membership.status, MembershipStatus.INVITED)
+
+        membership = invitation.accept(password="a-brand-new-password")
+        self.assertEqual(membership.status, MembershipStatus.ACTIVE)
+
+    def test_an_existing_password_is_never_re_validated(self):
+        """Somebody joining their second school is not asked to prove anything.
+
+        Their password was accepted under whatever policy applied when they set
+        it; tightening the rule must not lock them out of an invitation.
+        """
+        kemi = User.objects.create_user(
+            "kemi@example.com", PASSWORD, full_name="Kemi Bello", email="kemi@example.com"
+        )
+        with recording():
+            invitation, _ = self.invite(email="kemi@example.com")
+
+        membership = invitation.accept()
+        self.assertEqual(membership.status, MembershipStatus.ACTIVE)
+        kemi.refresh_from_db()
+        self.assertTrue(kemi.check_password(PASSWORD))
+
+
 class PendingIsNotStaffTests(InvitationSetUp):
     """An unaccepted invitation must not read as a working member of staff."""
 
@@ -422,6 +590,12 @@ class DeliveryTests(InvitationSetUp):
         )
 
     def test_an_invitee_with_no_email_is_refused_by_the_email_channel(self):
+        before = (
+            Invitation.objects.count(),
+            User.objects.count(),
+            Membership.objects.count(),
+        )
+
         with override_settings(
             EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
             INVITATION_CHANNEL="schools.delivery.EmailChannel",
@@ -429,6 +603,36 @@ class DeliveryTests(InvitationSetUp):
             with self.assertRaises(NoDeliveryAddress):
                 with self.captureOnCommitCallbacks(execute=True):
                     self.invite(email=None, phone="08031234567")
+
+        # The half this test used to leave unsaid, and the reason the bug it
+        # was meant to cover survived it. Refusing is only half the job: asking
+        # the channel *after* commit meant the placeholder user, the membership
+        # and an undeliverable invitation all outlived the error, one more
+        # orphaned set per retry.
+        self.assertEqual(
+            (
+                Invitation.objects.count(),
+                User.objects.count(),
+                Membership.objects.count(),
+            ),
+            before,
+            "a refused delivery must leave nothing behind",
+        )
+
+    def test_a_channel_that_cannot_pre_check_still_works(self):
+        """`check_deliverable()` is the optional half of the seam.
+
+        `RecordingChannel` defines `send()` and nothing else, which is the point
+        of it — the contract is duck-typed, and a double must not have to
+        inherit or implement its way into compliance.
+        """
+        self.assertFalse(hasattr(RecordingChannel, "check_deliverable"))
+        with recording():
+            with self.captureOnCommitCallbacks(execute=True):
+                invitation, raw_token = self.invite()
+
+        self.assertEqual(RecordingChannel.sent[-1]["raw_token"], raw_token)
+        self.assertEqual(Invitation.validate_token(raw_token), invitation)
 
 
 class InviteeResolutionTests(InvitationSetUp):

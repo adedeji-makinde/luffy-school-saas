@@ -31,9 +31,9 @@ from schools.delivery import NoDeliveryAddress
 from schools.models import (
     Invitation,
     InvitationError,
-    InvitationStatus,
     PasswordRequired,
     School,
+    WeakPassword,
 )
 
 api = NinjaAPI(title="Luffy School API", version="1.0.0")
@@ -50,11 +50,25 @@ class InviteIn(Schema):
 
 
 class InvitationOut(Schema):
+    """What the issuing admin is told back.
+
+    Deliberately says nothing about *who* the invitation resolved to. Identity
+    is global here, so a matching account may belong to a person this school has
+    no relationship with — echoing their stored name would hand a school admin a
+    stranger's real name from another school. Worse, the echo differed between a
+    reused account and a fresh placeholder, which made the endpoint an
+    exists/does-not-exist oracle for any email or phone on the platform, one
+    unsolicited invitation email per probe.
+
+    The admin already knows who they invited: they typed the identifier. The
+    invitee's own name is shown to the invitee, on `PreviewOut`, where the token
+    is the proof that they are the person being named.
+    """
+
     id: int
     status: str
     role: str
     school: str
-    invitee: str
     expires_at: str
 
     @staticmethod
@@ -64,7 +78,6 @@ class InvitationOut(Schema):
             status=invitation.status,
             role=invitation.intended_role,
             school=invitation.school.name,
-            invitee=invitation.user.full_name or invitation.user.username,
             expires_at=invitation.expires_at.isoformat(),
         )
 
@@ -124,6 +137,13 @@ def create_invitation(request, slug: str, payload: InviteIn):
         )
     except NotPermitted as exc:
         raise HttpError(403, str(exc))
+    except (
+        invitation_service.AlreadyAMember,
+        invitation_service.MembershipNotOpen,
+    ) as exc:
+        # 409, not 400: the request is well formed and the caller has the
+        # authority. It is the state at this school that leaves nothing to do.
+        raise HttpError(409, str(exc))
     except (invitation_service.InvitationError, NoDeliveryAddress) as exc:
         raise HttpError(400, str(exc))
     return 201, InvitationOut.of(invitation)
@@ -161,7 +181,10 @@ def resend_invitation(request, slug: str, invitation_id: int):
         )
     except NotPermitted as exc:
         raise HttpError(403, str(exc))
-    except invitation_service.AlreadyAccepted as exc:
+    except (
+        invitation_service.AlreadyAccepted,
+        invitation_service.MembershipNotOpen,
+    ) as exc:
         raise HttpError(409, str(exc))
     except NoDeliveryAddress as exc:
         raise HttpError(400, str(exc))
@@ -220,9 +243,10 @@ def accept_invitation(request, token: str, payload: AcceptIn):
     invitation = _validated(token)
     try:
         membership = invitation.accept(password=payload.password)
-    except PasswordRequired as exc:
+    except (PasswordRequired, WeakPassword) as exc:
         # 422 rather than 400: the request was well formed and the token is
-        # good, but a field the preview asked for is missing.
+        # good, but the password field is missing or not good enough. Both are
+        # things the invitee can fix and resubmit, unlike a spent link.
         raise HttpError(422, str(exc))
     except InvitationError as exc:
         raise HttpError(409, str(exc))

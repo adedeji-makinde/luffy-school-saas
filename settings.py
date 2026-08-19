@@ -57,6 +57,18 @@ MIDDLEWARE = [
 
 AUTH_USER_MODEL = "accounts.User"
 
+# Django ships no validators by default, which meant the one path in this
+# codebase that sets a password on somebody's behalf — Invitation.accept() —
+# would take a single character. What it writes is a *global* credential: it
+# signs the person in at every school they hold a membership at, so it is worth
+# a floor. Add the rest of Django's stock validators here if the policy grows.
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 10},
+    },
+]
+
 # Staff, parents and students all sign in through the same door. They just
 # reach for different identifiers, so accept any of username / email / phone.
 AUTHENTICATION_BACKENDS = ["accounts.backends.IdentifierBackend"]

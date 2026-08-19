@@ -7,9 +7,11 @@ which is a channel with its own templates, credentials, failure modes and
 regulatory rules. If `Invitation.send()` existed, adding that second channel
 would mean opening the model.
 
-So a channel is anything with `send(invitation, raw_token, *, accept_url)`.
-`invitations.py` resolves one and calls it; nothing in `models.py` imports this
-module at all, and the dependency deliberately points this way only.
+So a channel is anything with `send(invitation, raw_token, *, accept_url)`, and
+optionally a `check_deliverable(invitation)` that answers whether this person is
+reachable at all without sending anything. `invitations.py` resolves one and
+calls it; nothing in `models.py` imports this module at all, and the dependency
+deliberately points this way only.
 
 Note what a channel is handed and what it is not: the **raw token**, which is
 never persisted, and never the `Invitation` row's `token_hash`. A channel is the
@@ -22,12 +24,27 @@ from django.core.mail import send_mail
 from django.utils.module_loading import import_string
 
 
+class NoDeliveryAddress(Exception):
+    """The invitee has no address the selected channel can reach."""
+
+
 class Channel:
     """The seam. Implement `send()` and register the path in settings.
 
     Not an ABC on purpose — a test double should be able to be a plain object
     with a `send` method, without inheriting anything.
+
+    `check_deliverable()` is the optional second half of the contract, and it is
+    optional precisely so that "a plain object with a `send`" stays true. It
+    answers "could this channel reach this person?" *without* sending, which
+    lets `invitations.py` ask the question while the transaction is still open
+    and roll the whole invitation back if the answer is no. `send()` itself runs
+    after commit, far too late to undo anything.
     """
+
+    def check_deliverable(self, invitation):
+        """Raise `NoDeliveryAddress` if this channel has no way to reach them."""
+        return None
 
     def send(self, invitation, raw_token, *, accept_url):  # pragma: no cover
         raise NotImplementedError
@@ -44,13 +61,19 @@ class EmailChannel(Channel):
 
     subject_template = "You have been invited to join {school}"
 
-    def send(self, invitation, raw_token, *, accept_url):
+    def check_deliverable(self, invitation):
         recipient = invitation.user.email
         if not recipient:
             raise NoDeliveryAddress(
                 f"{invitation.user} has no email address, and email is the only "
                 "channel enabled for staff invitations in this pass."
             )
+        return recipient
+
+    def send(self, invitation, raw_token, *, accept_url):
+        # Asked again rather than trusted: `send()` is reachable on its own, and
+        # the pre-commit check happened in a different transaction state.
+        recipient = self.check_deliverable(invitation)
         send_mail(
             subject=self.subject_template.format(school=invitation.school.name),
             message=self._body(invitation, accept_url),
@@ -68,10 +91,6 @@ class EmailChannel(Channel):
             f"The link stops working on "
             f"{invitation.expires_at.strftime('%d %B %Y')}."
         )
-
-
-class NoDeliveryAddress(Exception):
-    """The invitee has no address the selected channel can reach."""
 
 
 def get_channel():

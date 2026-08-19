@@ -38,6 +38,19 @@ class AlreadyAccepted(InvitationError):
     """Nothing left to resend — the invitee is already in."""
 
 
+class AlreadyAMember(InvitationError):
+    """There is nothing to invite them to: they already hold this role here."""
+
+
+class MembershipNotOpen(InvitationError):
+    """The relationship an invitation would activate is no longer open.
+
+    Suspended or ended, rather than accepted. Its own type because the answer
+    differs: an accepted invitee needs nothing, while a suspended or ended one
+    needs the membership reinstated before any link is worth sending.
+    """
+
+
 def resolve_invitee(*, email=None, phone=None, full_name="", username=None):
     """Find the `User` this invite is for, creating one only if there is none.
 
@@ -112,6 +125,14 @@ def invite_staff(
     The membership is created at INVITED, which is a real relationship that
     grants no access: it appears on the school's roster and not in any
     active-staff query. Acceptance is what promotes it.
+
+    Somebody who already holds this role here is refused rather than re-invited.
+    `grant_membership()` is idempotent and returns a live row untouched, so the
+    requested `status=INVITED` would be silently dropped and the token would be
+    minted against an ACTIVE membership — a working credential for a live
+    account, sent to somebody who never asked for one. An *ended* membership is
+    not in the way: re-hiring is a real thing, and reviving the row to INVITED
+    is what should happen.
     """
     if role not in STAFF_ROLES:
         raise NotStaffRole(
@@ -121,6 +142,28 @@ def invite_staff(
     _require_grant_authority(actor, school)
 
     user, _created = resolve_invitee(email=email, phone=phone, full_name=full_name)
+
+    # Locked, not merely read: `grant_membership()` takes the same row under
+    # `select_for_update` a line later, and checking without the lock would
+    # leave a window for a concurrent invite to slip past this guard.
+    existing = (
+        Membership.objects.select_for_update()
+        .filter(user=user, school=school, role=role)
+        .first()
+    )
+    if existing is not None and existing.is_live:
+        if existing.status == MembershipStatus.ACTIVE:
+            raise AlreadyAMember(
+                f"{user} is already {existing.get_role_display().lower()} at "
+                f"{school}. Nothing to accept."
+            )
+        if existing.status != MembershipStatus.INVITED:
+            raise MembershipNotOpen(
+                f"{user}'s membership at {school} is "
+                f"{existing.get_status_display().lower()}. Reinstate it rather "
+                f"than inviting them again."
+            )
+
     membership = grant_membership(
         user, school, role, status=MembershipStatus.INVITED
     )
@@ -142,10 +185,25 @@ def resend_invitation(actor, invitation, *, ttl=None, accept_url_for=None):
     ordinary reason somebody asks for another. An accepted one may not: the
     person is already in, and minting a fresh token against a live membership
     would put a working credential for an active account in an inbox.
+
+    That last rule is asked of the **membership**, not of the row passed in, and
+    the distinction is the whole point. A resend mints a second row and revokes
+    the first, so after invite → resend → accept the membership is ACTIVE while
+    row one sits at REVOKED. Reading the rule off row one would see "revoked,
+    therefore resendable" and mint a live token for an account that is already
+    in — exactly the outcome the paragraph above forbids. The membership is the
+    thing acceptance moves, so it is the thing to ask.
     """
     _require_grant_authority(actor, invitation.school)
-    if invitation.status == InvitationStatus.ACCEPTED:
+
+    status = invitation.membership.status
+    if status == MembershipStatus.ACTIVE:
         raise AlreadyAccepted("That invitation has already been accepted.")
+    if status != MembershipStatus.INVITED:
+        raise MembershipNotOpen(
+            f"The membership this invitation activates is "
+            f"{invitation.membership.get_status_display().lower()}, not invited."
+        )
     if invitation.status == InvitationStatus.PENDING:
         invitation.revoke()
 
@@ -172,10 +230,28 @@ def _deliver(invitation, raw_token, accept_url_for):
     Sending happens through `transaction.on_commit`, so a delivery is never
     dispatched for an invitation that then rolls back — the alternative is a
     live link in somebody's inbox pointing at a row that does not exist.
+
+    But `on_commit` also means a failure inside `send()` arrives *after* the
+    commit, where it can no longer undo anything: the caller saw an error and
+    the placeholder user, the membership and an undeliverable invitation are all
+    still there, one more orphan per retry. So the deterministic half of that
+    failure — "there is no address to send to" — is asked first, here, while the
+    transaction is still open and raising still rolls everything back.
+
+    What remains post-commit is genuine infrastructure failure (an SMTP outage),
+    where the row surviving is the right outcome: the invitation exists and can
+    be resent once the channel is healthy.
     """
     if accept_url_for is None:
         return
     channel = get_channel()
+
+    # Optional half of the seam — a test double, or any channel that cannot
+    # answer without sending, simply does not define it. See delivery.Channel.
+    check_deliverable = getattr(channel, "check_deliverable", None)
+    if check_deliverable is not None:
+        check_deliverable(invitation)
+
     accept_url = accept_url_for(raw_token)
     transaction.on_commit(
         lambda: channel.send(invitation, raw_token, accept_url=accept_url)
@@ -209,8 +285,11 @@ def active_staff(school, *, role=None):
 
 
 __all__ = [
+    "AlreadyAMember",
+    "AlreadyAccepted",
     "AmbiguousInvitee",
     "InvitationError",
+    "MembershipNotOpen",
     "NotPermitted",
     "NotStaffRole",
     "Role",

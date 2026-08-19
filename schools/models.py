@@ -32,6 +32,16 @@ class PasswordRequired(InvitationError):
     invitee can act on — apart from "this link is spent", which they cannot.
     """
 
+
+class WeakPassword(InvitationError):
+    """The password offered at acceptance failed `AUTH_PASSWORD_VALIDATORS`.
+
+    Separate from `PasswordRequired` for the same reason that one is separate
+    from the rest: "choose a better one" is something the invitee can act on,
+    and it carries the validators' own messages so they can be shown what to fix.
+    """
+
+
 #: How long an invite link stays good for. Long enough to survive a weekend and
 #: a forwarded email; short enough that a leaked link goes stale on its own.
 DEFAULT_INVITATION_TTL = timedelta(days=7)
@@ -196,10 +206,20 @@ class Invitation(models.Model):
     def validate_token(cls, raw_token):
         """The pending invitation `raw_token` redeems, or None.
 
-        Returns None for a token that is unknown, already used, revoked, or past
-        its expiry — the caller cannot tell which, and should not: distinguishing
-        "no such invitation" from "that one is spent" tells an attacker holding a
-        guessed token whether they guessed a real one.
+        Returns None for a token that is unknown, already used, revoked, past
+        its expiry, or whose membership is no longer INVITED — the caller cannot
+        tell which, and should not: distinguishing "no such invitation" from
+        "that one is spent" tells an attacker holding a guessed token whether
+        they guessed a real one.
+
+        That last condition is why the membership's status is in the query. A
+        PENDING invitation is not enough on its own: ending or suspending a
+        membership leaves any outstanding invitation untouched, so without this
+        the link would still open, and redeeming it would set a password on an
+        account whose reason for existing has been withdrawn. Falling into the
+        same flat None as every other dead token is also the right answer to the
+        holder — "your membership was ended" is not their business to learn from
+        a link.
 
         Expiry is settled here rather than by a scheduled job. An invitation is
         only ever looked at when someone presents its token, so the lazy sweep
@@ -208,9 +228,17 @@ class Invitation(models.Model):
         """
         if not raw_token:
             return None
+
+        # Local for the same app-registry reason as the import in accept().
+        from accounts.models import MembershipStatus
+
         invitation = (
             cls.objects.select_related("membership__user", "membership__school")
-            .filter(token_hash=hash_token(raw_token), status=InvitationStatus.PENDING)
+            .filter(
+                token_hash=hash_token(raw_token),
+                status=InvitationStatus.PENDING,
+                membership__status=MembershipStatus.INVITED,
+            )
             .first()
         )
         if invitation is None:
@@ -251,6 +279,25 @@ class Invitation(models.Model):
         # reason and never need the class at import time.
         from accounts.models import MembershipStatus, User
 
+        # These two are local only to sit beside that one, not for any registry
+        # reason of their own.
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        # PENDING is not sufficient. The invitation is a credential for a
+        # relationship, and that relationship must still be open — a membership
+        # ended or suspended after the link went out must not be revivable by
+        # redeeming it, and the token must not become a way to set a password on
+        # an account whose reason for existing has been withdrawn. `validate_token()`
+        # already filters on this; asked again here because `accept()` is callable
+        # directly, and the rule is worth more than the path that reaches it.
+        membership = self.membership
+        if membership.status != MembershipStatus.INVITED:
+            raise InvitationError(
+                f"The membership this invitation activates is "
+                f"{membership.get_status_display().lower()}, not invited."
+            )
+
         # select_for_update: two clicks on the same link should not both run
         # this. The loser finds the row no longer PENDING and is refused above.
         user = User.objects.select_for_update().get(pk=self.membership.user_id)
@@ -260,6 +307,15 @@ class Invitation(models.Model):
                 raise PasswordRequired(
                     "This is your first sign-in, so a password is required."
                 )
+            # Validated here rather than at the endpoint because this is the
+            # only place in the codebase that sets a password on somebody's
+            # behalf, and what it writes is a *global* credential: it signs them
+            # in at every school they hold a membership at, not just this one.
+            # A rule worth having is not worth having only over HTTP.
+            try:
+                validate_password(password, user)
+            except DjangoValidationError as exc:
+                raise WeakPassword(" ".join(exc.messages)) from exc
             user.set_password(password)
             user.save(update_fields=["password"])
         # ...and if they already have one, `password` is ignored rather than
@@ -267,10 +323,10 @@ class Invitation(models.Model):
         # must not be able to silently reset an existing account's credential
         # through an invite link.
 
-        membership = self.membership
-        if membership.status == MembershipStatus.INVITED:
-            membership.status = MembershipStatus.ACTIVE
-            membership.save(update_fields=["status", "updated_at"])
+        # Unconditional: the guard above already established that this is the
+        # INVITED membership acceptance exists to promote.
+        membership.status = MembershipStatus.ACTIVE
+        membership.save(update_fields=["status", "updated_at"])
 
         self.status = InvitationStatus.ACCEPTED
         self.accepted_at = timezone.now()

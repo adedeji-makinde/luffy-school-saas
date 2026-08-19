@@ -1,4 +1,4 @@
-"""The four HTTP endpoints, exercised through the real middleware stack.
+"""The five HTTP endpoints, exercised through the real middleware stack.
 
 Not `RequestFactory`: these go through the Django test client so that
 `TenantMainMiddleware` and `SchoolAccessMiddleware` actually run, which is the
@@ -7,7 +7,7 @@ tenant, so `setUp` registers `testserver` as a domain of the **public** tenant �
 the portal host, where a person with memberships at several schools signs in and
 where an invitee with no membership anywhere can still reach an accept link.
 
-The split that matters here is who is on each end. The two `/api/schools/...`
+The split that matters here is who is on each end. The three `/api/schools/...`
 routes are an authenticated admin acting at their own school. The two
 `/api/invitations/{token}/` routes are somebody who is not signed in and may not
 even have a password yet — for them the token is the credential.
@@ -92,6 +92,57 @@ class InvitationApiTests(TestCase):
 
         raw_token = self.raw_token_of_last_invite()
         self.assertNotIn(raw_token, response.content.decode())
+
+    def test_the_response_does_not_reveal_whether_the_account_existed(self):
+        """The 201 must not answer "is this person already on the platform?".
+
+        It used to, twice over. It echoed the *resolved* account's stored name,
+        so a St Mary's admin naming a Grace Academy teacher's email read back
+        that teacher's real name; and because a brand-new invitee got the
+        submitted name echoed instead, the difference between the two answers
+        was a reliable existence oracle for any email or phone — with an
+        unsolicited invitation email sent on every probe.
+        """
+        self.client.force_login(self.admin)
+        kemi = User.objects.create_user(
+            "kemi@example.com",
+            PASSWORD,
+            full_name="Kemi Bello",
+            email="kemi@example.com",
+        )
+        grant_membership(kemi, self.grace, Role.TEACHER)  # another school entirely
+
+        existing = self.create_invite(email="kemi@example.com", full_name="Guess Who")
+        fresh = self.create_invite(email="nobody@example.com", full_name="Guess Who")
+
+        self.assertEqual(existing.status_code, 201)
+        self.assertEqual(fresh.status_code, 201)
+        self.assertNotIn("Kemi Bello", existing.content.decode())
+
+        def shape(response):
+            return {
+                key: value
+                for key, value in response.json().items()
+                if key not in {"id", "expires_at"}
+            }
+
+        self.assertEqual(shape(existing), shape(fresh), "the two answers must not differ")
+
+    def test_inviting_somebody_already_on_staff_is_a_conflict(self):
+        self.client.force_login(self.admin)
+        kemi = User.objects.create_user(
+            "kemi@example.com",
+            PASSWORD,
+            full_name="Kemi Bello",
+            email="kemi@example.com",
+        )
+        grant_membership(kemi, self.stmarys, Role.TEACHER)
+
+        response = self.create_invite(email="kemi@example.com")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertEqual(RecordingChannel.sent, [], "nobody was emailed")
 
     def test_issuing_requires_a_signed_in_caller(self):
         response = self.create_invite()
@@ -200,6 +251,53 @@ class InvitationApiTests(TestCase):
             Invitation.objects.get().status, InvitationStatus.PENDING, "nothing moved"
         )
 
+    def test_a_weak_password_is_refused_with_422(self):
+        """Same 422 as a missing one: the invitee can fix it and resubmit."""
+        self.client.force_login(self.admin)
+        self.create_invite()
+        token = self.raw_token_of_last_invite()
+        self.client.logout()
+
+        response = self.client.post(
+            f"/api/invitations/{token}/accept/",
+            data={"password": "short"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(Invitation.objects.get().status, InvitationStatus.PENDING)
+
+        # The same link still works with a better one.
+        retry = self.client.post(
+            f"/api/invitations/{token}/accept/",
+            data={"password": "a-brand-new-password"},
+            content_type="application/json",
+        )
+        self.assertEqual(retry.status_code, 200)
+
+    def test_an_ended_membership_makes_the_link_a_flat_404(self):
+        """Not a 409 explaining why — the same answer any dead token gets."""
+        self.client.force_login(self.admin)
+        self.create_invite()
+        token = self.raw_token_of_last_invite()
+        Invitation.objects.get().membership.end()
+        self.client.logout()
+
+        ended = self.client.get(f"/api/invitations/{token}/")
+        unknown = self.client.get("/api/invitations/not-a-real-token/")
+
+        self.assertEqual(ended.status_code, 404)
+        self.assertEqual(ended.json(), unknown.json())
+
+        accepted = self.client.post(
+            f"/api/invitations/{token}/accept/",
+            data={"password": "a-brand-new-password"},
+            content_type="application/json",
+        )
+        self.assertEqual(accepted.status_code, 404)
+        invitee = User.objects.get(email="new.teacher@example.com")
+        self.assertFalse(invitee.has_usable_password(), "no credential was handed out")
+
     def test_an_existing_person_accepts_with_no_password_at_all(self):
         kemi = User.objects.create_user(
             "kemi@example.com", PASSWORD, full_name="Kemi Bello", email="kemi@example.com"
@@ -307,6 +405,52 @@ class InvitationApiTests(TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(Invitation.objects.count(), 1, "no new row was minted")
+
+    def test_a_revoked_sibling_of_an_accepted_invitation_cannot_be_resent(self):
+        """The 409 has to survive the resend flow's own bookkeeping.
+
+        A resend revokes row one and mints row two. Once row two is accepted the
+        membership is ACTIVE, but row one still reads REVOKED — and "revoked" is
+        a resendable state. Asking the row rather than the membership let this
+        mint a working credential for an account that was already in.
+        """
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        first_id = created.json()["id"]
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(f"/api/schools/st-marys/invitations/{first_id}/resend/")
+        second_token = self.raw_token_of_last_invite()
+
+        self.client.logout()
+        self.client.post(
+            f"/api/invitations/{second_token}/accept/",
+            data={"password": "a-brand-new-password"},
+            content_type="application/json",
+        )
+
+        self.client.force_login(self.admin)
+        response = self.client.post(
+            f"/api/schools/st-marys/invitations/{first_id}/resend/"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            Invitation.objects.get(pk=first_id).status, InvitationStatus.REVOKED
+        )
+        self.assertEqual(Invitation.objects.count(), 2, "no third row was minted")
+
+    def test_resending_against_an_ended_membership_is_a_conflict(self):
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        Invitation.objects.get().membership.end()
+
+        response = self.client.post(
+            f"/api/schools/st-marys/invitations/{created.json()['id']}/resend/"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(Invitation.objects.count(), 1)
 
     def test_resending_requires_authority_at_that_school(self):
         operator = User.objects.create_user(
