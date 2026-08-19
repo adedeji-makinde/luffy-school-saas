@@ -19,7 +19,7 @@ from accounts.models import Membership, MembershipStatus, Role, STAFF_ROLES, Use
 from accounts.services import NotPermitted, _require_grant_authority, grant_membership
 
 from .delivery import get_channel
-from .models import Invitation, InvitationError
+from .models import Invitation, InvitationError, InviteeDeactivated
 
 # `InvitationError` is deliberately imported rather than defined here. This
 # module used to declare its own class of that name, which left two unrelated
@@ -93,7 +93,19 @@ def resolve_invitee(*, email=None, phone=None, full_name="", username=None):
             "invite by a single unambiguous identifier instead."
         )
     if matches:
-        return matches[0], False
+        user = matches[0]
+        # Reusing the account is the whole point of the lookup above, but a
+        # deactivated one is not a person to invite — it is a person whose access
+        # was deliberately taken away. Inviting them anyway walked the membership
+        # to ACTIVE on acceptance and wrote a new global password onto a disabled
+        # account. Reinstating them is `reactivate_user()`, and it should be
+        # somebody's decision rather than a side effect of an invite.
+        if not user.is_active:
+            raise InviteeDeactivated(
+                f"{user}'s account has been deactivated. Reinstate it before "
+                f"inviting them."
+            )
+        return user, False
 
     # Staff are invited by email in this pass, so the email is the natural
     # handle; a phone-only invite falls back to the number, which
@@ -265,6 +277,23 @@ def _issue(membership, actor, *, ttl=None):
     spirit as the one-school-per-student index, and a migration this does not
     need in order to hold in practice.
     """
+    # Asked at the mint rather than at each call site, for the same reason the
+    # stale-token sweep below is: `invite_staff()` refuses a deactivated invitee
+    # earlier and with a better message, but `resend_invitation()` reaches here
+    # from an existing row and would otherwise put a fresh live token in the
+    # inbox of an account whose access was deliberately taken away.
+    #
+    # Read from the database rather than through `membership.user`. A resend is
+    # handed an `Invitation` loaded by the caller — `api.py` selects it related —
+    # so the cached user is as old as that query, and "was this person disabled
+    # since?" is precisely the question being asked.
+    invitee = User.objects.get(pk=membership.user_id)
+    if not invitee.is_active:
+        raise InviteeDeactivated(
+            f"{invitee}'s account has been deactivated. Reinstate it before "
+            f"issuing an invitation."
+        )
+
     stale = (
         Invitation.objects.select_for_update().filter(membership=membership).pending()
     )
@@ -340,6 +369,7 @@ __all__ = [
     "AlreadyAccepted",
     "AmbiguousInvitee",
     "InvitationError",
+    "InviteeDeactivated",
     "MembershipNotOpen",
     "NotPermitted",
     "NotStaffRole",

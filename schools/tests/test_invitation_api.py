@@ -18,7 +18,8 @@ from datetime import timedelta
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from accounts.models import MembershipStatus, Role, User
+from accounts.deletion import deactivate_user
+from accounts.models import Membership, MembershipStatus, Role, User
 from accounts.services import grant_membership
 from schools import invitations as invitation_service
 from schools.models import Domain, Invitation, InvitationStatus, School
@@ -587,3 +588,43 @@ class InvitationApiTests(TestCase):
         self.assertEqual(response.status_code, 404)
         elsewhere.refresh_from_db()
         self.assertEqual(elsewhere.status, InvitationStatus.PENDING)
+
+    # -- a deactivated invitee ------------------------------------------------
+
+    def test_inviting_a_deactivated_person_is_a_conflict(self):
+        """409, not 400: the request is fine, the account's state is not."""
+        kemi = User.objects.create_user(
+            "kemi@example.com", PASSWORD, full_name="Kemi Bello",
+            email="kemi@example.com",
+        )
+        deactivate_user(kemi)
+
+        self.client.force_login(self.admin)
+        response = self.create_invite(email="kemi@example.com")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("deactivated", response.json()["detail"])
+        self.assertEqual(Invitation.objects.count(), 0)
+
+    def test_a_link_stops_resolving_once_its_invitee_is_deactivated(self):
+        """404 and nothing else — the same answer every dead token gets."""
+        self.client.force_login(self.admin)
+        self.create_invite()
+        raw_token = self.raw_token_of_last_invite()
+        self.client.logout()
+
+        deactivate_user(User.objects.get(email="new.teacher@example.com"))
+
+        preview = self.client.get(f"/api/invitations/{raw_token}/")
+        self.assertEqual(preview.status_code, 404)
+
+        accept = self.client.post(
+            f"/api/invitations/{raw_token}/accept/",
+            data={"password": PASSWORD},
+            content_type="application/json",
+        )
+        self.assertEqual(accept.status_code, 404)
+        self.assertEqual(
+            Membership.objects.get(user__email="new.teacher@example.com").status,
+            MembershipStatus.INVITED,
+        )

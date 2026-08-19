@@ -31,6 +31,7 @@ from schools.delivery import NoDeliveryAddress
 from schools.models import (
     Invitation,
     InvitationError,
+    InviteeDeactivated,
     PasswordRequired,
     School,
     WeakPassword,
@@ -148,10 +149,12 @@ def create_invitation(request, slug: str, payload: InviteIn):
     except (
         invitation_service.AlreadyAMember,
         invitation_service.MembershipNotOpen,
+        InviteeDeactivated,
     ) as exc:
         # 409, not 400: the request is well formed and the caller has the
-        # authority. It is the state at this school that leaves nothing to do.
-        # Ahead of the InvitationError handler below, which is their base class.
+        # authority. It is the state — at this school, or of the account being
+        # invited — that leaves nothing to do. Ahead of the InvitationError
+        # handler below, which is their base class.
         raise HttpError(409, str(exc))
     except (InvitationError, NoDeliveryAddress) as exc:
         raise HttpError(400, str(exc))

@@ -334,9 +334,11 @@ backup is not a set of live invitations. `create_with_token()` returns the raw t
 its caller once; after that it exists only in whatever the recipient received. A lost
 token is reissued, never recovered.
 
-`validate_token()` answers `None` for unknown, spent, revoked, expired **and
-no-longer-invited** alike, and the endpoints turn all five into the same 404 — telling a
-guesser that a token was *once* real is telling them they guessed a real one. Expiry is
+`validate_token()` answers `None` for unknown, spent, revoked, expired, no-longer-invited
+**and deactivated-invitee** alike, and the endpoints turn all six into the same 404 —
+telling a guesser that a token was *once* real is telling them they guessed a real one.
+Nor does the holder of a real token learn that the account behind it was disabled; that
+is not something a link should explain. Expiry is
 settled lazily on lookup rather than by a scheduled job, so a row cannot sit in `pending`
 past its date because a cron job is broken.
 
@@ -359,6 +361,19 @@ Nothing else is unique but `token_hash` — deliberately no "one invitation per 
 per contact detail, because a shared phone number must not collide. Note the distinction:
 per-*membership* is a different claim, since a membership is already one person at one
 school in one role.
+
+**A deactivated account cannot be invited, and cannot accept.** `deactivate_user()` is how
+access is taken away and it erases nothing, so the row is still there for
+`matching_identifier()` to find — which is exactly why the flow has to ask rather than
+assume a match is a person to invite. Nothing did, and the consequence ran the length of
+the flow: the membership went to `INVITED`, mail went out, and acceptance promoted it to
+`ACTIVE` while writing a fresh global password onto an account the platform had disabled.
+The school was left with a teacher on its roster and in `active_staff()` who could never
+sign in, because `is_active` is refused at the door by `IdentifierBackend`. The rule is
+asked at four points, because each is reachable alone: `resolve_invitee()` (inviting),
+`_issue()` (minting, which is what covers a resend), `validate_token()` (looking up) and
+`accept()` (redeeming). Reinstating somebody is `reactivate_user()` — a decision worth
+making deliberately rather than one an invitation makes on the platform's behalf.
 
 **Row locks in this flow are deliberately narrow.** `Membership.Meta.ordering` sorts by
 `school__name` and `user__full_name`, and Postgres locks a row in *every* joined table

@@ -1,4 +1,4 @@
-"""What the invitation flow locks, and what it must not.
+"""The invitation flow under concurrency: what it locks, and what it refuses.
 
 `TransactionTestCase` rather than `TestCase`, and real threads: these need two
 database connections whose commits are visible to each other, which a test
@@ -20,9 +20,11 @@ from django.db.utils import OperationalError
 from django.test import TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
-from accounts.models import MembershipStatus, Role, User
+from accounts.deletion import deactivate_user
+from accounts.models import Membership, MembershipStatus, Role, User
 from accounts.services import grant_membership
 from schools import invitations as invitation_service
+from schools.models import Invitation, InvitationError
 from schools.tests.test_invitations import PASSWORD, RecordingChannel, make_school
 
 
@@ -43,6 +45,57 @@ def run_in_thread(fn):
     thread = threading.Thread(target=wrapped)
     thread.start()
     return thread
+
+
+@override_settings(INVITATION_CHANNEL="schools.tests.test_invitations.RecordingChannel")
+class AcceptUnderConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        RecordingChannel.sent = []
+        self.school = make_school("St Mary's", "st-marys", "st_marys")
+        self.admin = User.objects.create_user(
+            "admin@st-marys.school", PASSWORD, full_name="Ada Admin",
+            email="admin@st-marys.school",
+        )
+        grant_membership(self.admin, self.school, Role.ADMIN)
+        self.invitation, self.raw_token = invitation_service.invite_staff(
+            self.admin,
+            self.school,
+            Role.TEACHER,
+            email="new.teacher@example.com",
+            full_name="New Teacher",
+            accept_url_for=lambda token: f"https://portal/i/{token}/",
+        )
+        self.membership = self.invitation.membership
+
+    def test_deactivating_the_invitee_kills_an_accept_in_flight(self):
+        """Deactivation is how access is taken away; a live link must not undo it."""
+        loaded = threading.Event()
+        deactivated = threading.Event()
+        outcome = {}
+
+        def accept():
+            invitation = Invitation.validate_token(self.raw_token)
+            loaded.set()
+            deactivated.wait(15)
+            try:
+                invitation.accept(password=PASSWORD)
+                outcome["accepted"] = True
+            except InvitationError as exc:
+                outcome["refused"] = str(exc)
+
+        thread = run_in_thread(accept)
+        self.assertTrue(loaded.wait(15), "the accepting thread never started")
+
+        deactivate_user(User.objects.get(pk=self.membership.user_id))
+        deactivated.set()
+        thread.join(20)
+
+        self.assertNotIn("accepted", outcome, "a disabled account was activated")
+        self.assertIn("deactivated", outcome["refused"])
+        self.assertEqual(
+            Membership.objects.get(pk=self.membership.pk).status,
+            MembershipStatus.INVITED,
+        )
 
 
 @override_settings(INVITATION_CHANNEL="schools.tests.test_invitations.RecordingChannel")

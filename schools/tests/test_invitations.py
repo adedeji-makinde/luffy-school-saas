@@ -19,6 +19,7 @@ from django.core import mail
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
+from accounts.deletion import deactivate_user, reactivate_user
 from accounts.models import Membership, MembershipStatus, Role, User
 from accounts.services import NotPermitted, grant_membership
 from schools import invitations as invitation_service
@@ -784,3 +785,106 @@ class InviteeResolutionTests(InvitationSetUp):
         with self.assertRaises(invitation_service.InvitationError):
             with recording():
                 self.invite(email=None, phone=None)
+
+
+class DeactivatedInviteeTests(InvitationSetUp):
+    """`deactivate_user()` is how access is taken away. Inviting must respect it.
+
+    Deactivation is deliberately reversible and erases nothing, so the row is
+    still there for `matching_identifier()` to find — which is exactly why the
+    flow has to ask. Nothing did, and the result was that a school could invite
+    somebody the platform had disabled, watch the membership go ACTIVE on
+    acceptance, and end up with a teacher on the roster and in `active_staff()`
+    who could never sign in. Acceptance would also write a fresh *global*
+    password onto the disabled account.
+
+    The rule is asked at four points because each is reachable on its own:
+    resolving the invitee, minting a token, validating one, and redeeming one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.kemi = User.objects.create_user(
+            "kemi@example.com",
+            PASSWORD,
+            full_name="Kemi Bello",
+            email="kemi@example.com",
+        )
+
+    def test_a_deactivated_person_cannot_be_invited(self):
+        deactivate_user(self.kemi)
+
+        with self.assertRaises(invitation_service.InviteeDeactivated):
+            with recording():
+                self.invite(email="kemi@example.com")
+
+        self.assertFalse(
+            Membership.objects.filter(user=self.kemi, school=self.stmarys).exists(),
+            "a membership was created for a disabled account",
+        )
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertEqual(RecordingChannel.sent, [])
+
+    def test_reactivating_them_makes_the_invite_work_again(self):
+        """The refusal is about current state, not a permanent mark."""
+        deactivate_user(self.kemi)
+        reactivate_user(self.kemi)
+
+        with recording():
+            invitation, _raw = self.invite(email="kemi@example.com")
+
+        self.assertEqual(invitation.membership.status, MembershipStatus.INVITED)
+
+    def test_a_pending_token_dies_when_the_invitee_is_deactivated(self):
+        """Minted before, deactivated after: the link stops working."""
+        with recording():
+            _invitation, raw_token = self.invite(email="kemi@example.com")
+
+        self.assertIsNotNone(Invitation.validate_token(raw_token))
+        deactivate_user(self.kemi)
+        self.assertIsNone(
+            Invitation.validate_token(raw_token),
+            "a disabled account's link still resolved",
+        )
+
+    def test_accept_refuses_directly_for_a_deactivated_invitee(self):
+        """`validate_token()` already filters this; `accept()` is callable alone."""
+        with recording():
+            invitation, _raw = self.invite(email="kemi@example.com")
+        deactivate_user(self.kemi)
+
+        with self.assertRaises(invitation_service.InviteeDeactivated):
+            invitation.accept()
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+        self.assertEqual(
+            Membership.objects.get(user=self.kemi, school=self.stmarys).status,
+            MembershipStatus.INVITED,
+        )
+
+    def test_a_resend_will_not_mint_a_fresh_token_for_a_disabled_account(self):
+        """The mint enforces it, so the rule holds however the row was reached."""
+        with recording():
+            invitation, _raw = self.invite(email="kemi@example.com")
+        deactivate_user(self.kemi)
+
+        with recording():
+            with self.assertRaises(invitation_service.InviteeDeactivated):
+                invitation_service.resend_invitation(
+                    self.admin,
+                    invitation,
+                    accept_url_for=lambda token: f"https://portal/i/{token}/",
+                )
+
+        self.assertEqual(Invitation.objects.count(), 1)
+        self.assertEqual(RecordingChannel.sent, [])
+
+    def test_the_placeholder_a_new_invite_creates_is_active(self):
+        """A fresh invitee has no usable password, which is not the same thing."""
+        with recording():
+            invitation, _raw = self.invite(email="brand.new@example.com")
+
+        user = invitation.membership.user
+        self.assertTrue(user.is_active)
+        self.assertFalse(user.has_usable_password())

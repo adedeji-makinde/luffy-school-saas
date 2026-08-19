@@ -51,6 +51,23 @@ class WeakPassword(InvitationError):
     """
 
 
+class InviteeDeactivated(InvitationError):
+    """The account this invitation is for has had its access taken away.
+
+    `deactivate_user()` is the supported way to remove somebody, and it is
+    deliberately reversible rather than a delete — which means the row is still
+    there for `matching_identifier()` to find. Nothing in the flow used to ask,
+    so inviting a deactivated person read as an ordinary invite: the membership
+    went to INVITED, the mail went out, and acceptance promoted it to ACTIVE and
+    wrote a fresh password onto an account the platform had disabled. The school
+    then had a teacher on its roster and in `active_staff()` who could never sign
+    in, because `is_active` is refused at the door by `IdentifierBackend`.
+
+    Reinstating them is `reactivate_user()`, which is a decision somebody should
+    make deliberately rather than one an invitation quietly makes for them.
+    """
+
+
 #: How long an invite link stays good for. Long enough to survive a weekend and
 #: a forwarded email; short enough that a leaked link goes stale on its own.
 DEFAULT_INVITATION_TTL = timedelta(days=7)
@@ -216,10 +233,10 @@ class Invitation(models.Model):
         """The pending invitation `raw_token` redeems, or None.
 
         Returns None for a token that is unknown, already used, revoked, past
-        its expiry, or whose membership is no longer INVITED — the caller cannot
-        tell which, and should not: distinguishing "no such invitation" from
-        "that one is spent" tells an attacker holding a guessed token whether
-        they guessed a real one.
+        its expiry, whose membership is no longer INVITED, or whose invitee has
+        been deactivated — the caller cannot tell which, and should not:
+        distinguishing "no such invitation" from "that one is spent" tells an
+        attacker holding a guessed token whether they guessed a real one.
 
         That last condition is why the membership's status is in the query. A
         PENDING invitation is not enough on its own: ending or suspending a
@@ -229,6 +246,11 @@ class Invitation(models.Model):
         same flat None as every other dead token is also the right answer to the
         holder — "your membership was ended" is not their business to learn from
         a link.
+
+        `is_active` is in the query for the same two reasons at the `User` level.
+        Deactivation takes away a person's access without erasing anything, so a
+        link minted before it must stop working; and the holder learns only that
+        the link is dead, not that the account behind it was disabled.
 
         Expiry is settled here rather than by a scheduled job. An invitation is
         only ever looked at when someone presents its token, so the lazy sweep
@@ -247,6 +269,7 @@ class Invitation(models.Model):
                 token_hash=hash_token(raw_token),
                 status=InvitationStatus.PENDING,
                 membership__status=MembershipStatus.INVITED,
+                membership__user__is_active=True,
             )
             .first()
         )
@@ -310,6 +333,15 @@ class Invitation(models.Model):
         # select_for_update: two clicks on the same link should not both run
         # this. The loser finds the row no longer PENDING and is refused above.
         user = User.objects.select_for_update().get(pk=self.membership.user_id)
+
+        # Asked here as well as in `validate_token()`, and for the same reason
+        # the membership is: this method is callable directly, and a deactivated
+        # account must not be handed a password by anything.
+        if not user.is_active:
+            raise InviteeDeactivated(
+                f"{user}'s account has been deactivated. Reinstate it before "
+                f"the invitation can be accepted."
+            )
 
         if not user.has_usable_password():
             if not password:
