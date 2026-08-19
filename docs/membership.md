@@ -360,6 +360,16 @@ per contact detail, because a shared phone number must not collide. Note the dis
 per-*membership* is a different claim, since a membership is already one person at one
 school in one role.
 
+**Row locks in this flow are deliberately narrow.** `Membership.Meta.ordering` sorts by
+`school__name` and `user__full_name`, and Postgres locks a row in *every* joined table
+when `FOR UPDATE` meets a join — so the default ordering silently put an exclusive lock on
+the **School** row into every membership lookup that took one, in `invite_staff()` and in
+`grant_membership()` alike. Two admins inviting two different teachers at one school
+queued behind a row neither was writing. `.order_by()` on those lookups drops the joins
+and the lock scope with them; `select_for_update(of=("self",))` narrows it the same way.
+`(user, school, role)` is uniquely constrained, so there is at most one row and no
+ordering to apply in the first place.
+
 Acceptance is the only path that sets a password, and what it writes is a *global*
 credential — it signs the person in at every school they hold a membership at, not just
 the one that invited them. `AUTH_PASSWORD_VALIDATORS` therefore has to be non-empty for

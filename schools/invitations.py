@@ -153,8 +153,20 @@ def invite_staff(
     # Locked, not merely read: `grant_membership()` takes the same row under
     # `select_for_update` a line later, and checking without the lock would
     # leave a window for a concurrent invite to slip past this guard.
+    #
+    # `.order_by()` is load-bearing. `Membership.Meta.ordering` sorts by
+    # `school__name` and `user__full_name`, so the default query JOINs
+    # `schools_school` and `accounts_user` — and a joined `FOR UPDATE` locks a
+    # row in *every* joined table, not just the one being read. That put an
+    # exclusive lock on the School row for the length of each invitation, so two
+    # admins inviting two different teachers at the same school serialised
+    # behind a row neither of them was touching. `(user, school, role)` is
+    # uniquely constrained, so there is at most one row here and nothing for an
+    # ordering to decide. `select_for_update(of=("self",))` narrows the lock the
+    # same way; dropping the ordering also drops the pointless joins.
     existing = (
         Membership.objects.select_for_update()
+        .order_by()
         .filter(user=user, school=school, role=role)
         .first()
     )
