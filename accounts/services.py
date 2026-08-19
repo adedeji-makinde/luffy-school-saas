@@ -31,6 +31,16 @@ class AlreadyEnrolled(MembershipError):
     pass
 
 
+class NotEnrolled(MembershipError):
+    """There is no live enrolment to release.
+
+    Its own type because the answer differs from `NotAStudent`: that one says
+    "this is the wrong kind of membership", while this says "it is the right
+    kind and it is already closed". A releasing school that sees this has
+    nothing left to do; a second release would only move `ended_on`.
+    """
+
+
 class NotAStudent(MembershipError):
     pass
 
@@ -98,7 +108,16 @@ def enroll_student(user, school, *, reference="", **fields):
     """Enrol `user` as a student at `school`.
 
     A student has exactly one school, so this refuses if they are already
-    enrolled somewhere else. Use `transfer_student` for a move.
+    enrolled somewhere else — and refuses by *naming* that school, which is what
+    tells a receiving admin the child has not been released yet rather than
+    leaving them to guess.
+
+    Also the receiving half of a transfer: once the previous school has called
+    `release_student()`, the old row is ended, the one-school slot is free, and
+    this is an ordinary admission. Guardians are re-linked here with
+    `link_guardian()`; `release_student()` leaves the old guardianship rows in
+    place precisely so there is something to read them off. `transfer_student()`
+    remains the both-ends-at-once version for a caller with authority at both.
     """
     existing = (
         Membership.objects.select_for_update()
@@ -156,6 +175,29 @@ def link_guardian(
     return link
 
 
+def _drop_parent_access_without_children(guardian, school):
+    """End `guardian`'s PARENT membership at `school` if no live child keeps it.
+
+    A login should not retain access to a school it has no reason to reach.
+    Memberships in other roles at that school are left alone — a teacher whose
+    own child leaves is still a teacher.
+
+    Read the query carefully: it asks whether any *live* guardianship remains,
+    so it must run **after** whatever ended the child's membership, not before.
+    Shared by `unlink_guardian()`, which removes one link, and
+    `release_student()`, which ends the enrolment underneath every link at once.
+    """
+    still_has_children = Guardianship.objects.filter(
+        guardian=guardian,
+        student__school=school,
+        student__status__in=LIVE_STATUSES,
+    ).exists()
+    if not still_has_children:
+        Membership.objects.filter(
+            user=guardian, school=school, role=Role.PARENT, status__in=LIVE_STATUSES
+        ).update(status=MembershipStatus.ENDED)
+
+
 @transaction.atomic
 def unlink_guardian(guardian, student):
     """Remove a parent's link to a child.
@@ -165,16 +207,64 @@ def unlink_guardian(guardian, student):
     to reach. Memberships in other roles at that school are left alone.
     """
     Guardianship.objects.filter(guardian=guardian, student=student).delete()
+    _drop_parent_access_without_children(guardian, student.school)
 
-    still_has_children = Guardianship.objects.filter(
-        guardian=guardian,
-        student__school=student.school,
-        student__status__in=LIVE_STATUSES,
-    ).exists()
-    if not still_has_children:
-        Membership.objects.filter(
-            user=guardian, school=student.school, role=Role.PARENT, status__in=LIVE_STATUSES
-        ).update(status=MembershipStatus.ENDED)
+
+@transaction.atomic
+def release_student(student, *, on=None):
+    """End an enrolment at the school the child is leaving. Returns the ended row.
+
+    Half of a transfer, and the half the *releasing* school owns. The other half
+    is `enroll_student()` at the receiving school. Splitting them is what lets an
+    ordinary school admin move a child at all: `transfer_student_as()` needs
+    authority at both ends, which in practice meant every transfer routed
+    through platform staff. Each half here needs authority at one school, and
+    neither school ever writes at the other — which is the property that made
+    destination-only authority the wrong answer, since it would let a receiving
+    school end a membership at a school it has no relationship with.
+
+    The membership is ended, never deleted: it is the child's record of having
+    been here, and the partial unique index keys off `status <> 'ended'`, so
+    ending it is also what frees the one-school slot for the receiving school to
+    fill.
+
+    Guardianship rows are **kept**, still pointing at the now-ended membership.
+    They are history in the same way the membership is, and they are the only
+    record of who this child's guardians were — which is what the receiving
+    school needs, since it has to re-link them itself (`student.guardianships`
+    reaches them). What does not survive is the parents' *access*: a guardian
+    with no other live child here loses their PARENT membership at this school,
+    exactly as `unlink_guardian()` would have dropped it.
+
+    Two consequences worth knowing, both of them the cost of not writing across
+    schools. Between the release and the admission the child belongs to no
+    school, so `student_membership()` returns `None` and they appear on no
+    parent's dashboard. And nothing here records an *intent* to transfer or who
+    agreed to it — a `TransferRequest` handshake would close the window and keep
+    that record, and is the next step rather than something this does.
+    """
+    if student.role != Role.STUDENT:
+        raise NotAStudent("Only a STUDENT membership can be released.")
+    if not student.is_live:
+        raise NotEnrolled(
+            f"{student.user} is not currently enrolled at {student.school}; "
+            f"that membership is {student.get_status_display().lower()}."
+        )
+
+    school = student.school
+    guardians = [
+        link.guardian
+        for link in Guardianship.objects.filter(student=student).select_related("guardian")
+    ]
+
+    student.end(on)
+
+    # After the end, never before: the query behind this asks whether a *live*
+    # child still keeps the parent here, and the child just stopped being one.
+    for guardian in guardians:
+        _drop_parent_access_without_children(guardian, school)
+
+    return student
 
 
 @transaction.atomic
@@ -258,10 +348,30 @@ def unlink_guardian_as(actor, guardian, student):
 
 
 @transaction.atomic
+def release_student_as(actor, student):
+    """The releasing school's half of a transfer. Authority at that school only.
+
+    Deliberately takes no destination. This function cannot know where the child
+    is going and must not care: the moment it accepted a `to_school` it would be
+    a cross-school write wearing a one-sided signature. The receiving school
+    admits them with `enroll_student_as()`, under its own authority.
+    """
+    _require_grant_authority(actor, student.school)
+    return release_student(student)
+
+
+@transaction.atomic
 def transfer_student_as(actor, student, to_school, **kwargs):
-    # A transfer ends a membership at one school and opens one at another, so
-    # it needs authority at both ends — in practice platform staff, or an admin
-    # who happens to hold a membership at both schools.
+    """Both halves at once, for a caller with authority at both ends.
+
+    Kept for platform staff, and for the rare admin who genuinely holds a
+    membership at both schools, because it does in one transaction what the
+    two-sided path does in two — no window where the child belongs to nowhere,
+    and guardians carried across rather than re-linked by hand.
+
+    It is not the ordinary path. An admin at one school should use
+    `release_student_as()`, and the receiving school `enroll_student_as()`.
+    """
     _require_grant_authority(actor, student.school)
     _require_grant_authority(actor, to_school)
     return transfer_student(student, to_school, **kwargs)

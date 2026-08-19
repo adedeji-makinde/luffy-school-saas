@@ -130,8 +130,31 @@ UniqueConstraint(fields=["user"], condition=Q(role="student") & ~Q(status="ended
 Two things follow. It is global rather than per-school — possible only because
 `Membership` is shared — so a second live student row *anywhere* is rejected. And
 `status="ended"` releases it, so graduations and transfers keep their history instead
-of being deleted. Use `services.transfer_student()`, which ends the old membership,
-opens the new one, and carries the guardians across.
+of being deleted.
+
+A transfer is **two one-sided acts**, because no school may write a row at another:
+
+| Act | Who calls it | Authority needed |
+| --- | --- | --- |
+| `release_student_as(actor, student)` | the school the child is leaving | that school only |
+| `enroll_student_as(actor, user, school)` | the school admitting them | that school only |
+
+`release_student_as()` takes no destination, deliberately — the moment it accepted a
+`to_school` it would be a cross-school write wearing a one-sided signature. Ending the old
+row is also what frees the one-school slot, since the partial index keys off
+`status <> 'ended'`, so the ordering is forced rather than conventional: admission before
+release is refused with `AlreadyEnrolled`, naming the school still holding the child.
+
+Guardianship rows survive a release, still pointing at the ended membership. They are the
+only record of who the child's guardians were, and the receiving school re-links them from
+it (`student.guardianships`) with `link_guardian_as()` under its own authority. What does
+not survive is the parents' *access*: a guardian with no other live child at the releasing
+school loses their PARENT membership there.
+
+`services.transfer_student_as()` is kept for platform staff and for the rare admin holding
+memberships at both schools. It does both halves in one transaction — no window, and
+guardians carried across rather than re-linked — but it is not the ordinary path, because
+requiring authority at both ends is what made ordinary transfers impossible.
 
 ## Deleting things
 
@@ -275,29 +298,25 @@ either way. Nothing about the current `User.phone`/`User.email`/
 
 ## Open items
 
-Both deliberately deferred, not overlooked. Neither is started.
+Deliberately deferred, not overlooked.
 
-**1. Transfers need a handshake.** `transfer_student_as()` requires authority at both the
-old and the new school. Since an admin normally holds authority at one school only, that
-means **an ordinary school admin can never transfer a student** — in practice every
-transfer routes through platform staff, which does not scale.
+**1. ~~Transfers need a handshake.~~ Split into two one-sided acts; the handshake itself
+is still open.** `transfer_student_as()` required authority at both ends, which an ordinary
+school admin never has, so every transfer routed through platform staff. See
+[Students](#students): `release_student_as()` and `enroll_student_as()` now each need
+authority at one school, and neither writes at the other.
 
-The agreed direction is to stop treating it as one operation and split it into two
-one-sided acts: `release_student_as(actor, student)` (old school ends the membership,
-authority at the old school only) followed by the existing `enroll_student_as()` (new
-school admits). Neither school ever writes at the other, and the partial index already
-allows it — once the old row is `ended`, the slot is free. `Membership.end()` and
-`enroll_student_as()` already exist, so this is a small change with no migration.
+Rejected on principle, and still rejected: destination-only authority. It would let a
+receiving school unilaterally end a membership at a school it has no relationship with,
+which is exactly the cross-school write this model exists to prevent.
 
-Two costs to handle: guardians must be re-linked by the receiving school, and there is a
-window between release and admission where the child belongs to no school, so
-`student_membership()` returns `None`. A `TransferRequest` handshake — either side
-initiates, the other accepts, then `transfer_student()` runs — would close the window and
-record who agreed, which matters the first time a transfer is disputed.
-
-Rejected on principle: destination-only authority. It would let a receiving school
-unilaterally end a membership at a school it has no relationship with, which is exactly
-the cross-school write this model exists to prevent.
+What remains is the part the split does not buy. Between the release and the admission the
+child belongs to no school — `student_membership()` returns `None`, they appear on no
+parent's dashboard, and nothing records that a transfer was ever intended or who agreed to
+it. A `TransferRequest` handshake — either side initiates, the other accepts, then
+`transfer_student()` runs in one transaction — would close the window and keep that
+record, which matters the first time a transfer is disputed. The tests pin the window
+rather than hiding it, so a caller cannot assume it is not there.
 
 **2. ~~No invitation flow.~~ Built for staff; parents and students still open.**
 See [Inviting staff](#inviting-staff) below. The warning this item carried turned out to
