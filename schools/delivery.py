@@ -21,6 +21,7 @@ one place the raw token legitimately exists outside the mint, which is also why
 
 from django.conf import settings
 from django.core.mail import send_mail
+from django.utils import timezone
 from django.utils.module_loading import import_string
 
 
@@ -84,12 +85,16 @@ class EmailChannel(Channel):
         return recipient
 
     def _body(self, invitation, accept_url):
+        # localtime(), not the stored value: `expires_at` is UTC and the reader
+        # is in TIME_ZONE. An expiry at 23:30 UTC is already the next day in
+        # Lagos, so formatting the raw value advertised the wrong deadline for
+        # every invitation whose link died in the last hour of the UTC day.
+        expires_at = timezone.localtime(invitation.expires_at)
         return (
             f"{invitation.invited_by.get_full_name()} has invited you to join "
             f"{invitation.school.name} as {invitation.membership.get_role_display()}.\n\n"
             f"Accept the invitation:\n{accept_url}\n\n"
-            f"The link stops working on "
-            f"{invitation.expires_at.strftime('%d %B %Y')}."
+            f"The link stops working on {expires_at.strftime('%d %B %Y')}."
         )
 
 

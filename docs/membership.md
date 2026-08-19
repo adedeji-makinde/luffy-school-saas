@@ -390,3 +390,19 @@ with `send(invitation, raw_token, *, accept_url)`, resolved from `INVITATION_CHA
 parents is a new class beside `EmailChannel` and a settings value — not an edit to
 `Invitation`. Sending is dispatched through `transaction.on_commit`, so no link is ever
 delivered for an invitation whose transaction rolled back.
+
+That dispatch cuts both ways, which is why a channel may also answer
+`check_deliverable(invitation)`. Because `send()` runs *after* the commit, a failure
+inside it cannot undo anything — the caller saw an error while the placeholder user, the
+membership and an undeliverable invitation all survived, one more orphaned set per retry.
+The deterministic half of that failure, "there is no address to reach them at", is asked
+before the commit instead. It is optional, so a channel that cannot answer without
+sending — and a test double that is a plain object with a `send` — remains valid.
+
+**`EMAIL_BACKEND` must not default to the console backend.** It once did, and that failed
+open in both directions: nothing was delivered, nothing raised, and the whole message —
+accept URL and live token — went to stdout, which in a container is the application log.
+The default is now SMTP, which fails loudly; local development opts into the console
+backend explicitly in `docker-compose.yml`. Anything that renders `expires_at` for a
+human goes through `timezone.localtime()` first — the column is UTC and the reader is in
+`TIME_ZONE`, so an expiry at 23:30 UTC is already tomorrow in Lagos.

@@ -91,9 +91,20 @@ INVITATION_CHANNEL = os.environ.get(
     "INVITATION_CHANNEL", "schools.delivery.EmailChannel"
 )
 
-EMAIL_BACKEND = os.environ.get(
-    "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
-)
+#: Not the console backend, which is what this used to default to. An invite
+#: link is a live credential, and the console backend writes the whole message
+#: — accept URL, token and all — to stdout, which in a container is the
+#: application log, readable by anyone who can read logs. It failed open in the
+#: other direction too: nothing was delivered and nothing raised, so a
+#: production deploy that never set this looked exactly like a working one.
+#:
+#: SMTP is Django's own default and fails closed on both counts: no silent
+#: non-delivery, and no credential in the logs. Local development opts into the
+#: console backend explicitly — see docker-compose.yml. (Django's test runner
+#: substitutes the locmem backend regardless of what is set here.)
+DEFAULT_EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", DEFAULT_EMAIL_BACKEND)
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@luffy.school")
 
 DATABASES = {

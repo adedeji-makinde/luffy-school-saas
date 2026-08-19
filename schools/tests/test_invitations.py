@@ -12,8 +12,9 @@ and none is done; `make_school()` here skips `CREATE SCHEMA` for the same reason
 `accounts/tests/test_membership.py` does.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as std_timezone
 
+from django.conf import settings
 from django.core import mail
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -21,7 +22,7 @@ from django.utils import timezone
 from accounts.models import Membership, MembershipStatus, Role, User
 from accounts.services import NotPermitted, grant_membership
 from schools import invitations as invitation_service
-from schools.delivery import NoDeliveryAddress
+from schools.delivery import EmailChannel, NoDeliveryAddress
 from schools.models import (
     Invitation,
     InvitationError,
@@ -562,6 +563,47 @@ class DeliveryTests(InvitationSetUp):
         self.assertEqual(message.to, ["new.teacher@example.com"])
         self.assertIn("St Mary's", message.subject)
         self.assertIn(raw_token, message.body)
+
+    def test_the_expiry_date_in_the_email_is_local_not_utc(self):
+        """The deadline the reader is given has to be the deadline they keep.
+
+        `expires_at` is stored in UTC and the recipient reads it in TIME_ZONE.
+        23:30 UTC is already the next day in Lagos, so formatting the raw stored
+        value understated the deadline by a day for every invitation whose link
+        died in the last hour of the UTC day.
+        """
+        with recording():
+            invitation, _ = self.invite()
+        invitation.expires_at = datetime(
+            2026, 8, 26, 23, 30, tzinfo=std_timezone.utc
+        )
+        invitation.save(update_fields=["expires_at"])
+
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+            TIME_ZONE="Africa/Lagos",
+        ):
+            mail.outbox = []
+            EmailChannel().send(
+                invitation, "a-token", accept_url="https://portal/i/a-token/"
+            )
+
+        body = mail.outbox[0].body
+        self.assertIn("27 August 2026", body)
+        self.assertNotIn("26 August 2026", body)
+
+    def test_the_default_email_backend_does_not_write_tokens_to_stdout(self):
+        """A live credential must not be the log's business.
+
+        The console backend prints the whole message — accept URL and token —
+        to stdout, which in a container is the application log. As a *default*
+        it also failed open the other way: nothing delivered, nothing raised, so
+        a production deploy that never set EMAIL_BACKEND was indistinguishable
+        from a working one. Local development opts in explicitly instead, in
+        docker-compose.yml.
+        """
+        self.assertNotIn("console", settings.DEFAULT_EMAIL_BACKEND)
+        self.assertNotIn("dummy", settings.DEFAULT_EMAIL_BACKEND)
 
     def test_the_model_does_not_import_the_delivery_module(self):
         """The seam, stated as a test rather than as a comment.
