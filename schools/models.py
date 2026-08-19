@@ -297,24 +297,60 @@ class Invitation(models.Model):
         membership", because the two can disagree: someone can hold a membership
         and still have never set a password.
         """
+        # Imported here, not at module scope. `schools` is loaded before
+        # `accounts` (see SHARED_APPS), so importing accounts.models while this
+        # module is being read would ask for an app registry that is still
+        # filling. The foreign keys above use string references for the same
+        # reason and never need the class at import time.
+        from accounts.models import Membership, MembershipStatus, User
+
+        # These two are local only to sit beside that one, not for any registry
+        # reason of their own.
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        # Locked and re-read *before* a single guard runs, because `self` and
+        # `self.membership` were loaded by `validate_token()` in an earlier
+        # transaction and every check below is a question about current state.
+        # Reading them off the in-memory copies was a lost update twice over:
+        #
+        #   - an accept that began before an admin's `end()` committed sailed
+        #     past the membership check on its stale INVITED and wrote ACTIVE
+        #     over the just-committed ENDED, resurrecting the relationship the
+        #     admin had closed and leaving `ended_on` set on a live row; and
+        #   - two clicks on one link both passed "is it still PENDING" before
+        #     either reached the lock, so the second returned success for a spent
+        #     token and overwrote `accepted_at`.
+        #
+        # Membership first, then Invitation, then User. `invite_staff()` takes
+        # the first two in that same order, and two transactions taking one pair
+        # of rows in opposite orders is a deadlock. `.order_by()` on the
+        # membership lookup is not cosmetic: `Membership.Meta.ordering` sorts by
+        # `school__name` and `user__full_name`, and a joined `FOR UPDATE` locks a
+        # row in every joined table — which would mean holding the School row for
+        # the length of every acceptance. `Invitation` and `User` order by their
+        # own columns, so neither joins and neither needs it.
+        membership = (
+            Membership.objects.select_for_update()
+            .order_by()
+            .get(pk=self.membership_id)
+        )
+        locked = Invitation.objects.select_for_update().get(pk=self.pk)
+        user = User.objects.select_for_update().get(pk=membership.user_id)
+
+        # Bring `self` up to date with what the lock just read, so the guards
+        # below and the caller's own object agree with the database.
+        self.status = locked.status
+        self.accepted_at = locked.accepted_at
+        self.expires_at = locked.expires_at
+        self.membership = membership
+
         if self.status != InvitationStatus.PENDING:
             raise InvitationError(f"This invitation is {self.get_status_display().lower()}.")
         if self.is_expired:
             self.status = InvitationStatus.EXPIRED
             self.save(update_fields=["status"])
             raise InvitationError("This invitation has expired.")
-
-        # Imported here, not at module scope. `schools` is loaded before
-        # `accounts` (see SHARED_APPS), so importing accounts.models while this
-        # module is being read would ask for an app registry that is still
-        # filling. The foreign keys above use string references for the same
-        # reason and never need the class at import time.
-        from accounts.models import MembershipStatus, User
-
-        # These two are local only to sit beside that one, not for any registry
-        # reason of their own.
-        from django.contrib.auth.password_validation import validate_password
-        from django.core.exceptions import ValidationError as DjangoValidationError
 
         # PENDING is not sufficient. The invitation is a credential for a
         # relationship, and that relationship must still be open — a membership
@@ -323,16 +359,11 @@ class Invitation(models.Model):
         # an account whose reason for existing has been withdrawn. `validate_token()`
         # already filters on this; asked again here because `accept()` is callable
         # directly, and the rule is worth more than the path that reaches it.
-        membership = self.membership
         if membership.status != MembershipStatus.INVITED:
             raise InvitationError(
                 f"The membership this invitation activates is "
                 f"{membership.get_status_display().lower()}, not invited."
             )
-
-        # select_for_update: two clicks on the same link should not both run
-        # this. The loser finds the row no longer PENDING and is refused above.
-        user = User.objects.select_for_update().get(pk=self.membership.user_id)
 
         # Asked here as well as in `validate_token()`, and for the same reason
         # the membership is: this method is callable directly, and a deactivated
@@ -364,8 +395,9 @@ class Invitation(models.Model):
         # must not be able to silently reset an existing account's credential
         # through an invite link.
 
-        # Unconditional: the guard above already established that this is the
-        # INVITED membership acceptance exists to promote.
+        # Unconditional: the guard above established that this is the INVITED
+        # membership acceptance exists to promote, and it read that off a row
+        # this transaction has held locked ever since.
         membership.status = MembershipStatus.ACTIVE
         membership.save(update_fields=["status", "updated_at"])
 

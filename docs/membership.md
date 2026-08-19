@@ -375,15 +375,26 @@ asked at four points, because each is reachable alone: `resolve_invitee()` (invi
 `accept()` (redeeming). Reinstating somebody is `reactivate_user()` — a decision worth
 making deliberately rather than one an invitation makes on the platform's behalf.
 
-**Row locks in this flow are deliberately narrow.** `Membership.Meta.ordering` sorts by
+**Acceptance decides on state it has locked.** `accept()` re-reads the membership, the
+invitation and the user under `select_for_update` before it checks anything, because the
+objects it was handed were loaded by `validate_token()` in an earlier transaction and
+every guard is a question about the present. Reading the in-memory copies was a lost
+update twice over: an acceptance that began before an admin's `end()` committed overwrote
+the just-written `ENDED` with `ACTIVE` — leaving `ended_on` set on a live row — and two
+clicks on one link both passed "is it still pending" before either reached the lock, so
+the second spent an already-spent token. The rows are taken in the order
+membership → invitation → user, which is the order `invite_staff()` takes the first two;
+two transactions taking one pair in opposite orders is a deadlock.
+
+Those locks are also deliberately narrow. `Membership.Meta.ordering` sorts by
 `school__name` and `user__full_name`, and Postgres locks a row in *every* joined table
 when `FOR UPDATE` meets a join — so the default ordering silently put an exclusive lock on
-the **School** row into every membership lookup that took one, in `invite_staff()` and in
-`grant_membership()` alike. Two admins inviting two different teachers at one school
-queued behind a row neither was writing. `.order_by()` on those lookups drops the joins
-and the lock scope with them; `select_for_update(of=("self",))` narrows it the same way.
-`(user, school, role)` is uniquely constrained, so there is at most one row and no
-ordering to apply in the first place.
+the **School** row into every membership lookup that took one — in `invite_staff()`, in
+`grant_membership()` and in `accept()` alike. Two admins inviting two different teachers
+at one school queued behind a row neither was writing. `.order_by()` on
+those lookups drops the joins and the lock scope with them; `select_for_update(of=("self",))`
+narrows it the same way. `(user, school, role)` is uniquely constrained, so there is at
+most one row and no ordering to apply in the first place.
 
 Acceptance is the only path that sets a password, and what it writes is a *global*
 credential — it signs the person in at every school they hold a membership at, not just
