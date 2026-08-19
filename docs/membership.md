@@ -391,6 +391,12 @@ name across schools and made the endpoint an exists/does-not-exist oracle for an
 phone on the platform — one unsolicited invitation email per probe. The invitee sees their
 own name on the preview, where the token proves who they are.
 
+`role` is the stored value on every response — `"teacher"`, never `"Teacher"`. The preview
+carries the label separately as `role_display`, because it is the one endpoint rendered to
+somebody who is not signed in and has no role vocabulary of their own. Keep them apart: a
+`role` that means the database value on some endpoints and the display label on others is
+a field a client cannot key off at all.
+
 **Delivery is a seam, not a method.** `schools/delivery.py` defines a channel as anything
 with `send(invitation, raw_token, *, accept_url)`, resolved from `INVITATION_CHANNEL`.
 `schools/models.py` does not import it and a test enforces that. Adding WhatsApp for

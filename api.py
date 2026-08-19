@@ -90,10 +90,18 @@ class PreviewOut(Schema):
     keeps their password, and asking them to choose a second one would be both
     confusing and wrong. The form renders a password field if and only if this
     is true, and `/accept/` enforces the same rule server-side.
+
+    `role` is the stored value here as it is on every other response, and
+    `role_display` carries the label. This endpoint used to put the label in
+    `role` itself, which made that field mean the database value on three
+    endpoints and the human label on this one — so a client keying off it broke
+    on whichever it had not been written against. Two fields say both things
+    without either being a guess.
     """
 
     school: str
     role: str
+    role_display: str
     invitee: str
     needs_password: bool
     expires_at: str
@@ -232,7 +240,8 @@ def preview_invitation(request, token: str):
     invitation = _validated(token)
     return PreviewOut(
         school=invitation.school.name,
-        role=invitation.membership.get_role_display(),
+        role=invitation.intended_role,
+        role_display=invitation.membership.get_role_display(),
         invitee=invitation.user.full_name or invitation.user.username,
         needs_password=invitation.needs_password,
         expires_at=invitation.expires_at.isoformat(),

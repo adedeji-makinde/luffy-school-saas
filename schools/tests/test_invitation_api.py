@@ -144,6 +144,37 @@ class InvitationApiTests(TestCase):
         self.assertEqual(Invitation.objects.count(), 0)
         self.assertEqual(RecordingChannel.sent, [], "nobody was emailed")
 
+    def test_role_means_the_same_thing_on_every_endpoint(self):
+        """One field, one vocabulary — the stored value, everywhere.
+
+        `role` used to be the database value on create and accept and the human
+        label on preview, so a client keying off it — to render an icon, to
+        prefill a resend form — broke on whichever of the two it had not been
+        written against. The label did not go away; it moved to `role_display`,
+        which only the invitee-facing preview needs.
+        """
+        self.client.force_login(self.admin)
+        created = self.create_invite()
+        token = self.raw_token_of_last_invite()
+        self.client.logout()
+
+        preview = self.client.get(f"/api/invitations/{token}/")
+        accepted = self.client.post(
+            f"/api/invitations/{token}/accept/",
+            data={"password": "a-brand-new-password"},
+            content_type="application/json",
+        )
+
+        for name, body in (
+            ("create", created.json()),
+            ("preview", preview.json()),
+            ("accept", accepted.json()),
+        ):
+            with self.subTest(endpoint=name):
+                self.assertEqual(body["role"], Role.TEACHER)
+
+        self.assertEqual(preview.json()["role_display"], "Teacher")
+
     def test_issuing_requires_a_signed_in_caller(self):
         response = self.create_invite()
         self.assertEqual(response.status_code, 401)
@@ -179,7 +210,8 @@ class InvitationApiTests(TestCase):
         body = response.json()
         self.assertTrue(body["needs_password"])
         self.assertEqual(body["school"], "St Mary's")
-        self.assertEqual(body["role"], "Teacher")
+        self.assertEqual(body["role"], Role.TEACHER)
+        self.assertEqual(body["role_display"], "Teacher")
 
     def test_the_preview_does_not_ask_an_existing_person_for_one(self):
         """The second-school case: they already have a password and keep it."""
