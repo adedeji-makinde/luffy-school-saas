@@ -156,6 +156,56 @@ memberships at both schools. It does both halves in one transaction — no windo
 guardians carried across rather than re-linked — but it is not the ordinary path, because
 requiring authority at both ends is what made ordinary transfers impossible.
 
+### The handshake
+
+Two one-sided acts move a child, but nothing connects them: no link between a release and
+the admission it was meant for, no record that anybody agreed, and a window in between
+where the child belongs to no school. `TransferRequest` is what connects them, and the
+idea fits in a sentence — **the handshake assembles two-sided authority out of two
+one-sided acts.**
+
+`transfer_student()` really does need authority at both ends. Requiring one *caller* to
+hold both is what broke ordinary transfers. So one school signs by requesting, the other
+by accepting, and only with both signatures does the transfer run — in one transaction,
+which is what closes the window. Neither side ever acted at the other's school; the pair
+of consents did.
+
+| Act | Called by | Authority needed |
+| --- | --- | --- |
+| `request_transfer_as(actor, student, to_school)` | either school | that actor's own end |
+| `accept_transfer_as(actor, request)` | the other school | the other end |
+| `decline_transfer_as(actor, request)` | the other school | the other end |
+| `withdraw_transfer_as(actor, request)` | the school that asked | its own end |
+
+Either end may ask. "We are letting this child go to Grace" and "we would like to admit
+this child from St Mary's" are one proposal seen from opposite sides, so `requested_side`
+records which it was — "who asked" is the first question anyone has when a transfer is
+disputed.
+
+**One person may not sign both halves.** Platform staff pass every authority check, and an
+admin can hold memberships at both schools, so nothing but an explicit rule stops one
+person producing a row that claims two schools agreed. `SameSignatory` is that rule. It is
+not a permissions check — the actor has already been found to hold the authority — it is a
+check on what the record *means*. Somebody who genuinely holds both ends does not need a
+handshake: `transfer_student_as()` is the one-caller path and says so in its signature.
+
+**At most one open request per enrolment**, as a partial unique index rather than an
+application check — the same spirit as the one-school slot it protects. Two open requests
+would let one admin agree to Grace and another to Hillside for the same child, and the
+second to land would find the enrolment gone. A second destination waits for the first to
+be declined or withdrawn.
+
+A request is a proposal about a relationship, and the relationship can move on while it
+sits there — the child released without a destination, graduated, moved by platform staff.
+Accepting then raises `EnrolmentMovedOn` rather than reviving an ended enrolment. Such a
+request keeps its `pending` status, because nobody declined it and rewriting the status
+would put a lie in the record this table exists to be; it simply drops out of
+`transfers_awaiting()`, which filters on the enrolment still being live. Status and queue
+answer different questions, and neither is allowed to fake the other's answer.
+
+There is no HTTP surface for any of this yet — it is a service-layer flow, like
+`release_student_as()` beside it.
+
 ## Deleting things
 
 `Membership.school` is **`PROTECT`**. Memberships and the guardianships hanging off
@@ -300,23 +350,21 @@ either way. Nothing about the current `User.phone`/`User.email`/
 
 Deliberately deferred, not overlooked.
 
-**1. ~~Transfers need a handshake.~~ Split into two one-sided acts; the handshake itself
-is still open.** `transfer_student_as()` required authority at both ends, which an ordinary
-school admin never has, so every transfer routed through platform staff. See
-[Students](#students): `release_student_as()` and `enroll_student_as()` now each need
-authority at one school, and neither writes at the other.
+**1. ~~Transfers need a handshake.~~ Built.** `transfer_student_as()` required authority at
+both ends, which an ordinary school admin never has, so every transfer routed through
+platform staff. Now two one-sided acts move a child (`release_student_as()` /
+`enroll_student_as()`), and `TransferRequest` connects them into a handshake that records
+both consents and runs the move in one transaction. See
+[The handshake](#the-handshake).
 
 Rejected on principle, and still rejected: destination-only authority. It would let a
 receiving school unilaterally end a membership at a school it has no relationship with,
 which is exactly the cross-school write this model exists to prevent.
 
-What remains is the part the split does not buy. Between the release and the admission the
-child belongs to no school — `student_membership()` returns `None`, they appear on no
-parent's dashboard, and nothing records that a transfer was ever intended or who agreed to
-it. A `TransferRequest` handshake — either side initiates, the other accepts, then
-`transfer_student()` runs in one transaction — would close the window and keep that
-record, which matters the first time a transfer is disputed. The tests pin the window
-rather than hiding it, so a caller cannot assume it is not there.
+Left open on purpose: no HTTP surface, and the unconnected two-act path still has its
+window. `release_student_as()` without a handshake is the right call when a child leaves
+for a school that is not on the platform — there is no second party to sign — so the gap
+is kept, and a test pins it rather than letting a caller assume it is not there.
 
 **2. ~~No invitation flow.~~ Built for staff; parents and students still open.**
 See [Inviting staff](#inviting-staff) below. The warning this item carried turned out to
