@@ -342,8 +342,23 @@ past its date because a cron job is broken.
 
 A resend revokes the old invitation and issues a second row rather than updating one in
 place, so the previous link dies the moment the new one is minted and both stay in the
-audit trail. Nothing is unique but `token_hash` — deliberately no "one invitation per
-person" or per contact detail, because a shared phone number must not collide.
+audit trail.
+
+**At most one invitation is pending per membership**, and that is enforced at the mint —
+`invitations._issue()` revokes every live invitation for the membership before creating
+the next one. Putting it there rather than in `resend_invitation()`, where it started, is
+what makes it an invariant instead of one path's behaviour: a second *invite* used to
+leave both links working, and reviving an ended membership used to bring its old pending
+invitation back with it. It is application-level, not a database constraint, so two
+callers minting for one membership at the same instant can still leave two live tokens;
+both are for the same person, school and role and both still expire, so the failure is
+benign. A partial unique index on `(membership)` where `status = 'pending'` is the
+airtight version, in the same spirit as the one-school-per-student index.
+
+Nothing else is unique but `token_hash` — deliberately no "one invitation per person" or
+per contact detail, because a shared phone number must not collide. Note the distinction:
+per-*membership* is a different claim, since a membership is already one person at one
+school in one role.
 
 Acceptance is the only path that sets a password, and what it writes is a *global*
 credential — it signs the person in at every school they hold a membership at, not just
@@ -374,8 +389,10 @@ more than one invitation over its life and each row's status describes only itse
   returns a live row *untouched*, so a requested `status=INVITED` is silently dropped
   against an `ACTIVE` membership. `invite_staff()` checks for a live membership under the
   same lock `grant_membership()` takes, and raises `AlreadyAMember` (409). An **ended**
-  membership is not in the way — re-hiring revives the row to `INVITED`, which also
-  revives any invitation still pending against it.
+  membership is not in the way — re-hiring revives the row to `INVITED`. The old link
+  does not come back with it: minting revokes whatever was still pending, so re-hiring
+  issues a fresh credential rather than resurrecting one raised for a relationship that
+  has since ended.
 
 All of these refusals share one base class, and that is worth stating because it briefly
 was not true: `schools.models.InvitationError`, re-exported from `schools.invitations`.

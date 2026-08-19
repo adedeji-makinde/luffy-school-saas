@@ -19,7 +19,7 @@ from accounts.models import Membership, MembershipStatus, Role, STAFF_ROLES, Use
 from accounts.services import NotPermitted, _require_grant_authority, grant_membership
 
 from .delivery import get_channel
-from .models import Invitation, InvitationError, InvitationStatus
+from .models import Invitation, InvitationError
 
 # `InvitationError` is deliberately imported rather than defined here. This
 # module used to declare its own class of that name, which left two unrelated
@@ -136,7 +136,10 @@ def invite_staff(
     minted against an ACTIVE membership — a working credential for a live
     account, sent to somebody who never asked for one. An *ended* membership is
     not in the way: re-hiring is a real thing, and reviving the row to INVITED
-    is what should happen.
+    is what should happen. What does not come back with it is the old link —
+    `_issue()` revokes any invitation still pending against the membership
+    before minting, so re-hiring issues a new credential rather than
+    resurrecting one that was minted for a relationship since ended.
     """
     if role not in STAFF_ROLES:
         raise NotStaffRole(
@@ -197,6 +200,10 @@ def resend_invitation(actor, invitation, *, ttl=None, accept_url_for=None):
     therefore resendable" and mint a live token for an account that is already
     in — exactly the outcome the paragraph above forbids. The membership is the
     thing acceptance moves, so it is the thing to ask.
+
+    Killing the old token is `_issue()`'s job, not this function's. It used to
+    be done here, on the row passed in, which meant the guarantee held only for
+    resends and only for that row.
     """
     _require_grant_authority(actor, invitation.school)
 
@@ -208,9 +215,6 @@ def resend_invitation(actor, invitation, *, ttl=None, accept_url_for=None):
             f"The membership this invitation activates is "
             f"{invitation.membership.get_status_display().lower()}, not invited."
         )
-    if invitation.status == InvitationStatus.PENDING:
-        invitation.revoke()
-
     fresh, raw_token = _issue(invitation.membership, actor, ttl=ttl)
     _deliver(fresh, raw_token, accept_url_for)
     return fresh, raw_token
@@ -224,6 +228,37 @@ def revoke_invitation(actor, invitation):
 
 
 def _issue(membership, actor, *, ttl=None):
+    """Mint a token for `membership`, killing every other live one it has.
+
+    At most one invitation per membership is live at a time. That was already
+    the intent — `resend_invitation()` revoked the row it was handed before
+    minting the replacement — but only along that one path, and only for that
+    one row. Inviting the same person twice left both tokens working, and
+    reviving an ended membership brought its old pending invitation back with
+    it, because the rule lived at the call site rather than at the mint.
+
+    Doing it here makes it a property of issuing rather than of resending, so
+    the invariant holds however the row was reached. It is also the honest
+    counterpart to tying a token's life to its membership: a link is dead once
+    the relationship it activates has moved on, and a link is dead once a newer
+    one exists for the same relationship.
+
+    Locked, because the whole point is that two of these must not overlap. The
+    lock serialises concurrent issues against the *existing* rows; it cannot
+    stop a concurrent INSERT, so two callers minting for one membership at the
+    same instant can still leave two live tokens. Both are for the same person,
+    school and role, and both still expire, so the failure is benign. Making it
+    impossible rather than unlikely wants a partial unique index on
+    (membership) where status = 'pending' — a real constraint, in the same
+    spirit as the one-school-per-student index, and a migration this does not
+    need in order to hold in practice.
+    """
+    stale = (
+        Invitation.objects.select_for_update().filter(membership=membership).pending()
+    )
+    for invitation in stale:
+        invitation.revoke()
+
     kwargs = {"ttl": ttl} if ttl is not None else {}
     return Invitation.create_with_token(membership, actor, **kwargs)
 

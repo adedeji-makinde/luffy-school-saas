@@ -269,6 +269,43 @@ class TokenLifecycleTests(InvitationSetUp):
         self.assertEqual(Invitation.validate_token(token), fresh)
         self.assertEqual(fresh.membership_id, invitation.membership_id)
 
+    def test_inviting_the_same_person_twice_leaves_one_live_token(self):
+        """The hole that only `resend_invitation()` used to close.
+
+        Revoking the previous row was done at the resend call site, on the row
+        it was handed, so a second *invite* against the same membership left
+        both links working — two live credentials for one relationship, and no
+        way to tell from either which one the admin meant.
+        """
+        with recording():
+            first, first_token = self.invite()
+            second, second_token = self.invite()
+
+        first.refresh_from_db()
+        self.assertEqual(first.status, InvitationStatus.REVOKED)
+        self.assertIsNone(Invitation.validate_token(first_token))
+        self.assertEqual(Invitation.validate_token(second_token), second)
+
+        # Both rows are kept: the audit trail is the reason a resend is a second
+        # row rather than an update, and that reasoning does not change here.
+        self.assertEqual(Invitation.objects.count(), 2)
+
+    def test_at_most_one_invitation_is_pending_per_membership(self):
+        """Stated as the invariant rather than as one path's behaviour."""
+        with recording():
+            invitation, _ = self.invite()
+            for _ in range(3):
+                invitation, _ = invitation_service.resend_invitation(
+                    self.admin, invitation
+                )
+            self.invite()
+
+        membership_id = invitation.membership_id
+        self.assertEqual(
+            Invitation.objects.filter(membership_id=membership_id).pending().count(), 1
+        )
+        self.assertEqual(Invitation.objects.count(), 5, "every row is kept")
+
     def test_an_unknown_token_is_simply_none(self):
         self.assertIsNone(Invitation.validate_token("not-a-real-token"))
         self.assertIsNone(Invitation.validate_token(""))
@@ -389,13 +426,7 @@ class MembershipStateGuardTests(InvitationSetUp):
         )
 
     def test_a_former_member_can_be_invited_back(self):
-        """The guard is about *live* memberships. Re-hiring is a real thing.
-
-        Note the consequence of tying a token's life to its membership: reviving
-        the row to INVITED revives any invitation still pending against it, so
-        the earlier link works again too. Both are the same person, school and
-        role, and both still expire on their own.
-        """
+        """The guard is about *live* memberships. Re-hiring is a real thing."""
         with recording():
             invitation, _ = self.invite()
         invitation.membership.end()
@@ -406,6 +437,26 @@ class MembershipStateGuardTests(InvitationSetUp):
         self.assertEqual(again.membership_id, invitation.membership_id)
         self.assertEqual(again.membership.status, MembershipStatus.INVITED)
         self.assertEqual(Invitation.validate_token(token), again)
+
+    def test_re_hiring_does_not_resurrect_the_old_link(self):
+        """The counterpart to tying a token's life to its membership.
+
+        Reviving an ended membership back to INVITED would otherwise revive
+        every invitation still pending against it, so a link minted for a
+        relationship that somebody deliberately ended would start working again
+        with nobody re-authorising it. `_issue()` revokes them on the way past.
+        """
+        with recording():
+            old, old_token = self.invite()
+        old.membership.end()
+
+        with recording():
+            _again, new_token = self.invite()
+
+        old.refresh_from_db()
+        self.assertEqual(old.status, InvitationStatus.REVOKED)
+        self.assertIsNone(Invitation.validate_token(old_token))
+        self.assertIsNotNone(Invitation.validate_token(new_token))
 
 
 class PasswordStrengthTests(InvitationSetUp):
