@@ -449,6 +449,39 @@ class PasswordStrengthTests(InvitationSetUp):
         self.assertTrue(kemi.check_password(PASSWORD))
 
 
+class ExceptionHierarchyTests(TestCase):
+    """One `InvitationError`, so `except InvitationError` means what it says.
+
+    There were two, one in each module, unrelated by inheritance and identical
+    in name. Catching the flow's refusals then depended on which module you had
+    imported from: `from schools.invitations import InvitationError` caught
+    nothing `accept()` or `revoke()` raised, and `api.py` had to qualify one of
+    the two at every call site to keep them apart. Nothing about that was
+    visible at the point of use, which is what made it worth a test rather than
+    a comment.
+    """
+
+    def test_the_two_modules_export_the_same_class(self):
+        from schools import invitations, models
+
+        self.assertIs(invitations.InvitationError, models.InvitationError)
+
+    def test_every_refusal_in_the_flow_shares_that_base(self):
+        from schools import invitations, models
+
+        for exc in (
+            invitations.NotStaffRole,
+            invitations.AmbiguousInvitee,
+            invitations.AlreadyAccepted,
+            invitations.AlreadyAMember,
+            invitations.MembershipNotOpen,
+            models.PasswordRequired,
+            models.WeakPassword,
+        ):
+            with self.subTest(exception=exc.__name__):
+                self.assertTrue(issubclass(exc, models.InvitationError))
+
+
 class PendingIsNotStaffTests(InvitationSetUp):
     """An unaccepted invitation must not read as a working member of staff."""
 

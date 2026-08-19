@@ -22,7 +22,16 @@ from django_tenants.models import DomainMixin, TenantMixin
 
 
 class InvitationError(Exception):
-    """An invitation was redeemed or cancelled in a state that does not allow it."""
+    """An invitation could not be issued, redeemed or cancelled as asked.
+
+    The base for every refusal in the flow, on both sides of the seam: the
+    states this module enforces (spent, expired, membership no longer invited)
+    and the ones `invitations.py` enforces (not a staff role, ambiguous invitee,
+    already a member). It lives here rather than there because the dependency
+    already runs this way — `invitations.py` imports this module, not the
+    reverse — so `except InvitationError` catches the whole flow no matter which
+    of the two a caller imported it from.
+    """
 
 
 class PasswordRequired(InvitationError):

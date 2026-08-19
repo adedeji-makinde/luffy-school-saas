@@ -377,6 +377,13 @@ more than one invitation over its life and each row's status describes only itse
   membership is not in the way — re-hiring revives the row to `INVITED`, which also
   revives any invitation still pending against it.
 
+All of these refusals share one base class, and that is worth stating because it briefly
+was not true: `schools.models.InvitationError`, re-exported from `schools.invitations`.
+The model's own refusals (`PasswordRequired`, `WeakPassword`, a spent or expired link) and
+the service's (`NotStaffRole`, `AmbiguousInvitee`, `AlreadyAccepted`, `AlreadyAMember`,
+`MembershipNotOpen`) all descend from it, so `except InvitationError` catches the whole
+flow no matter which of the two modules you imported it from.
+
 The API answers back with none of this. `InvitationOut` deliberately carries no invitee
 name: identity is global, so a matching account may belong to somebody this school has no
 relationship with, and echoing the *resolved* account's name both leaked a stranger's real

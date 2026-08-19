@@ -143,8 +143,9 @@ def create_invitation(request, slug: str, payload: InviteIn):
     ) as exc:
         # 409, not 400: the request is well formed and the caller has the
         # authority. It is the state at this school that leaves nothing to do.
+        # Ahead of the InvitationError handler below, which is their base class.
         raise HttpError(409, str(exc))
-    except (invitation_service.InvitationError, NoDeliveryAddress) as exc:
+    except (InvitationError, NoDeliveryAddress) as exc:
         raise HttpError(400, str(exc))
     return 201, InvitationOut.of(invitation)
 
@@ -181,13 +182,15 @@ def resend_invitation(request, slug: str, invitation_id: int):
         )
     except NotPermitted as exc:
         raise HttpError(403, str(exc))
-    except (
-        invitation_service.AlreadyAccepted,
-        invitation_service.MembershipNotOpen,
-    ) as exc:
-        raise HttpError(409, str(exc))
     except NoDeliveryAddress as exc:
         raise HttpError(400, str(exc))
+    except InvitationError as exc:
+        # AlreadyAccepted and MembershipNotOpen both land here, and so does
+        # anything else the flow refuses on state grounds — which is what this
+        # endpoint's refusals are. One handler is safe now that there is one
+        # hierarchy; while there were two, a models-side refusal escaping here
+        # was a 500.
+        raise HttpError(409, str(exc))
     return 201, InvitationOut.of(fresh)
 
 

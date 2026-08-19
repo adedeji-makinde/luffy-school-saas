@@ -19,11 +19,15 @@ from accounts.models import Membership, MembershipStatus, Role, STAFF_ROLES, Use
 from accounts.services import NotPermitted, _require_grant_authority, grant_membership
 
 from .delivery import get_channel
-from .models import Invitation, InvitationStatus
+from .models import Invitation, InvitationError, InvitationStatus
 
-
-class InvitationError(Exception):
-    """The invite could not be issued as asked."""
+# `InvitationError` is deliberately imported rather than defined here. This
+# module used to declare its own class of that name, which left two unrelated
+# exceptions sharing one name in one package: `except InvitationError` caught
+# the half you happened to have imported and let the other half through, and
+# `api.py` had to keep the two apart by qualifying one of them. It lives in
+# `models.py` because the dependency already runs that way — everything below
+# subclasses it, so one `except InvitationError` now means what it looks like.
 
 
 class NotStaffRole(InvitationError):
