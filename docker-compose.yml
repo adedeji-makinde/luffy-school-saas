@@ -8,6 +8,11 @@ services:
       - .:/workspace:cached
       - claude-config:/home/vscode/.claude
     command: sleep infinity
+    environment:
+      # Development only, and deliberately explicit. settings.py defaults to
+      # SMTP so that a deploy which never sets this fails loudly instead of
+      # printing live invitation tokens to the application log.
+      EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
     depends_on:
       - db
     

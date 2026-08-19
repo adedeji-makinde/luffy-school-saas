@@ -67,8 +67,18 @@ def grant_membership(user, school, role, *, status=MembershipStatus.ACTIVE, **fi
 
     Idempotent: calling it twice returns the same row.
     """
+    # `.order_by()` because `Membership.Meta.ordering` joins `schools_school`
+    # and `accounts_user`, and Postgres locks a row in every joined table when
+    # `FOR UPDATE` is used with a join. Without it this held an exclusive lock on
+    # the School row — a row this function never writes — for the length of every
+    # caller's transaction, serialising unrelated grants at the same school.
+    # `(user, school, role)` is uniquely constrained, so there is at most one row
+    # and no ordering to apply.
     membership = (
-        Membership.objects.select_for_update().filter(user=user, school=school, role=role).first()
+        Membership.objects.select_for_update()
+        .order_by()
+        .filter(user=user, school=school, role=role)
+        .first()
     )
     if membership is None:
         return Membership.objects.create(

@@ -299,11 +299,176 @@ Rejected on principle: destination-only authority. It would let a receiving scho
 unilaterally end a membership at a school it has no relationship with, which is exactly
 the cross-school write this model exists to prevent.
 
-**2. No invitation flow.** Nothing sets `invited` except an explicit `status=` argument —
-no tokens, no email, no acceptance step. When it is built, remember that identity is
-global, so the two states are orthogonal: whether the *person* has a usable credential
-(`User`-level) and whether *this school's* relationship has been accepted
-(`Membership`-level). A parent invited to a second school may already have a full account
-with a password, and a flow assuming "invite ⇒ create account" would break that case —
-which is the case this model exists to serve. `create_user(username, None)` yields an
-unusable password and cannot authenticate, which is the natural placeholder.
+**2. ~~No invitation flow.~~ Built for staff; parents and students still open.**
+See [Inviting staff](#inviting-staff) below. The warning this item carried turned out to
+be the load-bearing part of the design and survives intact: identity is global, so the
+two states are orthogonal — whether the *person* has a usable credential (`User`-level)
+and whether *this school's* relationship has been accepted (`Membership`-level).
+`Invitation.needs_password` is exactly that distinction, and the preview endpoint reports
+it so a teacher joining their second school is never asked for a second password.
+
+What remains open is the other half of the audience: parents and students. That is not
+the same flow with a different role value. Parents commonly share one phone between two
+guardians, students often have neither email nor phone, and both need a channel that is
+not email — which is why delivery is a seam rather than a method (see below).
+
+## Inviting staff
+
+An admin invites by email or phone plus an intended role. The person is resolved through
+`User.objects.matching_identifier()` — the same lookup sign-in uses, so an invite can
+never find somebody a later login would not — and an existing account is **reused**, not
+duplicated. Only if there is no match at all is a placeholder created with
+`create_user(username, None)`, whose unusable password cannot authenticate until
+acceptance sets one.
+
+The `Membership` is created immediately at `INVITED`. That is a real relationship which
+grants no access: it appears on `services.school_directory()` and is absent from
+`invitations.active_staff()`. Acceptance promotes it to `ACTIVE`. So an `Invitation` is a
+credential for a relationship that already exists in the data, not a promise of one —
+which is why it holds a single foreign key to the membership rather than repeating the
+person, school and role as three columns that could drift.
+
+**Tokens are stored as SHA-256 digests and never in the clear**, on the same reasoning as
+a password: whoever can read the table cannot mint a working link from it, so a leaked
+backup is not a set of live invitations. `create_with_token()` returns the raw token to
+its caller once; after that it exists only in whatever the recipient received. A lost
+token is reissued, never recovered.
+
+`validate_token()` answers `None` for unknown, spent, revoked, expired, no-longer-invited
+**and deactivated-invitee** alike, and the endpoints turn all six into the same 404 —
+telling a guesser that a token was *once* real is telling them they guessed a real one.
+Nor does the holder of a real token learn that the account behind it was disabled; that
+is not something a link should explain. Expiry is
+settled lazily on lookup rather than by a scheduled job, so a row cannot sit in `pending`
+past its date because a cron job is broken.
+
+A resend revokes the old invitation and issues a second row rather than updating one in
+place, so the previous link dies the moment the new one is minted and both stay in the
+audit trail.
+
+**At most one invitation is pending per membership**, and that is enforced at the mint —
+`invitations._issue()` revokes every live invitation for the membership before creating
+the next one. Putting it there rather than in `resend_invitation()`, where it started, is
+what makes it an invariant instead of one path's behaviour: a second *invite* used to
+leave both links working, and reviving an ended membership used to bring its old pending
+invitation back with it. It is application-level, not a database constraint, so two
+callers minting for one membership at the same instant can still leave two live tokens;
+both are for the same person, school and role and both still expire, so the failure is
+benign. A partial unique index on `(membership)` where `status = 'pending'` is the
+airtight version, in the same spirit as the one-school-per-student index.
+
+Nothing else is unique but `token_hash` — deliberately no "one invitation per person" or
+per contact detail, because a shared phone number must not collide. Note the distinction:
+per-*membership* is a different claim, since a membership is already one person at one
+school in one role.
+
+**A deactivated account cannot be invited, and cannot accept.** `deactivate_user()` is how
+access is taken away and it erases nothing, so the row is still there for
+`matching_identifier()` to find — which is exactly why the flow has to ask rather than
+assume a match is a person to invite. Nothing did, and the consequence ran the length of
+the flow: the membership went to `INVITED`, mail went out, and acceptance promoted it to
+`ACTIVE` while writing a fresh global password onto an account the platform had disabled.
+The school was left with a teacher on its roster and in `active_staff()` who could never
+sign in, because `is_active` is refused at the door by `IdentifierBackend`. The rule is
+asked at four points, because each is reachable alone: `resolve_invitee()` (inviting),
+`_issue()` (minting, which is what covers a resend), `validate_token()` (looking up) and
+`accept()` (redeeming). Reinstating somebody is `reactivate_user()` — a decision worth
+making deliberately rather than one an invitation makes on the platform's behalf.
+
+**Acceptance decides on state it has locked.** `accept()` re-reads the membership, the
+invitation and the user under `select_for_update` before it checks anything, because the
+objects it was handed were loaded by `validate_token()` in an earlier transaction and
+every guard is a question about the present. Reading the in-memory copies was a lost
+update twice over: an acceptance that began before an admin's `end()` committed overwrote
+the just-written `ENDED` with `ACTIVE` — leaving `ended_on` set on a live row — and two
+clicks on one link both passed "is it still pending" before either reached the lock, so
+the second spent an already-spent token. The rows are taken in the order
+membership → invitation → user, which is the order `invite_staff()` takes the first two;
+two transactions taking one pair in opposite orders is a deadlock.
+
+Those locks are also deliberately narrow. `Membership.Meta.ordering` sorts by
+`school__name` and `user__full_name`, and Postgres locks a row in *every* joined table
+when `FOR UPDATE` meets a join — so the default ordering silently put an exclusive lock on
+the **School** row into every membership lookup that took one — in `invite_staff()`, in
+`grant_membership()` and in `accept()` alike. Two admins inviting two different teachers
+at one school queued behind a row neither was writing. `.order_by()` on
+those lookups drops the joins and the lock scope with them; `select_for_update(of=("self",))`
+narrows it the same way. `(user, school, role)` is uniquely constrained, so there is at
+most one row and no ordering to apply in the first place.
+
+Acceptance is the only path that sets a password, and what it writes is a *global*
+credential — it signs the person in at every school they hold a membership at, not just
+the one that invited them. `AUTH_PASSWORD_VALIDATORS` therefore has to be non-empty for
+that path to mean anything; Django ships it empty. `accept()` calls `validate_password()`
+itself rather than leaving it to the endpoint, and raises `WeakPassword`, which the API
+renders as 422 beside `PasswordRequired` — both are things the invitee can fix and
+resubmit with the same link.
+
+### Every rule is asked of the membership, not of the row
+
+An `Invitation` is a credential for a relationship, so the relationship is what decides
+whether the credential is still good. This is not a stylistic preference; asking the
+invitation row instead is wrong in ways that are easy to miss, because a membership has
+more than one invitation over its life and each row's status describes only itself:
+
+- **A token dies with its membership.** `Membership.end()` and a suspension leave any
+  outstanding invitation `pending`, so `validate_token()` requires the membership to be
+  `INVITED` as well. Without that, a withdrawn relationship left a working link behind —
+  and redeeming it still set that global password. `accept()` re-checks rather than
+  trusting the lookup, because it is callable directly.
+- **A resend asks the membership too.** After `invite → resend → accept`, row one is
+  `REVOKED` and the membership is `ACTIVE`. "Revoked" is a resendable state, so a rule
+  keyed off row one would happily mint a live token for somebody already in — the exact
+  thing the rule exists to prevent. `AlreadyAccepted` (409) is raised off
+  `membership.status`; suspended and ended give `MembershipNotOpen`.
+- **Inviting an existing member is refused.** `grant_membership()` is idempotent and
+  returns a live row *untouched*, so a requested `status=INVITED` is silently dropped
+  against an `ACTIVE` membership. `invite_staff()` checks for a live membership under the
+  same lock `grant_membership()` takes, and raises `AlreadyAMember` (409). An **ended**
+  membership is not in the way — re-hiring revives the row to `INVITED`. The old link
+  does not come back with it: minting revokes whatever was still pending, so re-hiring
+  issues a fresh credential rather than resurrecting one raised for a relationship that
+  has since ended.
+
+All of these refusals share one base class, and that is worth stating because it briefly
+was not true: `schools.models.InvitationError`, re-exported from `schools.invitations`.
+The model's own refusals (`PasswordRequired`, `WeakPassword`, a spent or expired link) and
+the service's (`NotStaffRole`, `AmbiguousInvitee`, `AlreadyAccepted`, `AlreadyAMember`,
+`MembershipNotOpen`) all descend from it, so `except InvitationError` catches the whole
+flow no matter which of the two modules you imported it from.
+
+The API answers back with none of this. `InvitationOut` deliberately carries no invitee
+name: identity is global, so a matching account may belong to somebody this school has no
+relationship with, and echoing the *resolved* account's name both leaked a stranger's real
+name across schools and made the endpoint an exists/does-not-exist oracle for any email or
+phone on the platform — one unsolicited invitation email per probe. The invitee sees their
+own name on the preview, where the token proves who they are.
+
+`role` is the stored value on every response — `"teacher"`, never `"Teacher"`. The preview
+carries the label separately as `role_display`, because it is the one endpoint rendered to
+somebody who is not signed in and has no role vocabulary of their own. Keep them apart: a
+`role` that means the database value on some endpoints and the display label on others is
+a field a client cannot key off at all.
+
+**Delivery is a seam, not a method.** `schools/delivery.py` defines a channel as anything
+with `send(invitation, raw_token, *, accept_url)`, resolved from `INVITATION_CHANNEL`.
+`schools/models.py` does not import it and a test enforces that. Adding WhatsApp for
+parents is a new class beside `EmailChannel` and a settings value — not an edit to
+`Invitation`. Sending is dispatched through `transaction.on_commit`, so no link is ever
+delivered for an invitation whose transaction rolled back.
+
+That dispatch cuts both ways, which is why a channel may also answer
+`check_deliverable(invitation)`. Because `send()` runs *after* the commit, a failure
+inside it cannot undo anything — the caller saw an error while the placeholder user, the
+membership and an undeliverable invitation all survived, one more orphaned set per retry.
+The deterministic half of that failure, "there is no address to reach them at", is asked
+before the commit instead. It is optional, so a channel that cannot answer without
+sending — and a test double that is a plain object with a `send` — remains valid.
+
+**`EMAIL_BACKEND` must not default to the console backend.** It once did, and that failed
+open in both directions: nothing was delivered, nothing raised, and the whole message —
+accept URL and live token — went to stdout, which in a container is the application log.
+The default is now SMTP, which fails loudly; local development opts into the console
+backend explicitly in `docker-compose.yml`. Anything that renders `expires_at` for a
+human goes through `timezone.localtime()` first — the column is UTC and the reader is in
+`TIME_ZONE`, so an expiry at 23:30 UTC is already tomorrow in Lagos.

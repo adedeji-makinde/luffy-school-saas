@@ -57,6 +57,18 @@ MIDDLEWARE = [
 
 AUTH_USER_MODEL = "accounts.User"
 
+# Django ships no validators by default, which meant the one path in this
+# codebase that sets a password on somebody's behalf — Invitation.accept() —
+# would take a single character. What it writes is a *global* credential: it
+# signs the person in at every school they hold a membership at, so it is worth
+# a floor. Add the rest of Django's stock validators here if the policy grows.
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 10},
+    },
+]
+
 # Staff, parents and students all sign in through the same door. They just
 # reach for different identifiers, so accept any of username / email / phone.
 AUTHENTICATION_BACKENDS = ["accounts.backends.IdentifierBackend"]
@@ -67,6 +79,33 @@ AUTHENTICATION_BACKENDS = ["accounts.backends.IdentifierBackend"]
 PHONE_DEFAULT_REGION = os.environ.get("PHONE_DEFAULT_REGION", "NG")
 
 ROOT_URLCONF = "urls"
+
+# ---------------------------------------------------------------------------
+# Invitations
+#
+# The channel is a dotted path rather than a hard-coded class so that adding
+# WhatsApp for parents later is a settings change and a new class beside
+# EmailChannel, not an edit to the Invitation model. See schools/delivery.py.
+# ---------------------------------------------------------------------------
+INVITATION_CHANNEL = os.environ.get(
+    "INVITATION_CHANNEL", "schools.delivery.EmailChannel"
+)
+
+#: Not the console backend, which is what this used to default to. An invite
+#: link is a live credential, and the console backend writes the whole message
+#: — accept URL, token and all — to stdout, which in a container is the
+#: application log, readable by anyone who can read logs. It failed open in the
+#: other direction too: nothing was delivered and nothing raised, so a
+#: production deploy that never set this looked exactly like a working one.
+#:
+#: SMTP is Django's own default and fails closed on both counts: no silent
+#: non-delivery, and no credential in the logs. Local development opts into the
+#: console backend explicitly — see docker-compose.yml. (Django's test runner
+#: substitutes the locmem backend regardless of what is set here.)
+DEFAULT_EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", DEFAULT_EMAIL_BACKEND)
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@luffy.school")
 
 DATABASES = {
     "default": {
