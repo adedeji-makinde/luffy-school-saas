@@ -10,6 +10,7 @@ here, so callers never have to remember them:
 """
 
 from django.db import transaction
+from django.utils import timezone
 
 from .models import (
     LIVE_STATUSES,
@@ -19,6 +20,9 @@ from .models import (
     MembershipStatus,
     Relationship,
     Role,
+    TransferRequest,
+    TransferRequestStatus,
+    TransferRoute,
     User,
 )
 
@@ -371,10 +375,43 @@ def transfer_student_as(actor, student, to_school, **kwargs):
 
     It is not the ordinary path. An admin at one school should use
     `release_student_as()`, and the receiving school `enroll_student_as()`.
+
+    Leaves a `TransferRequest` behind, marked `SINGLE_PARTY`. Without it this
+    table would log only the transfers that went through a handshake, which is
+    the wrong half: the transfers with the least independent oversight — one
+    person, both ends, nobody to disagree — would have been the ones with no
+    record at all. The row names `actor` as both signatures and carries no side,
+    because there was no second party and no first mover; it says one authority
+    did this, which is what happened.
     """
     _require_grant_authority(actor, student.school)
     _require_grant_authority(actor, to_school)
-    return transfer_student(student, to_school, **kwargs)
+
+    # Captured before the move: `transfer_student()` ends this row and opens a
+    # new one, and the record has to point at the enrolment that was left, the
+    # same as a handshake row does.
+    leaving = student
+    already_there = student.school_id == to_school.pk
+
+    moved = transfer_student(student, to_school, **kwargs)
+    if already_there:
+        # `transfer_student()` returns the row untouched in this case. Nothing
+        # happened, so nothing is recorded as having happened.
+        return moved
+
+    TransferRequest.objects.create(
+        student=leaving,
+        to_school=to_school,
+        requested_by=actor,
+        resolved_by=actor,
+        resolved_at=timezone.now(),
+        # No side: see TransferRoute.SINGLE_PARTY.
+        requested_side=None,
+        route=TransferRoute.SINGLE_PARTY,
+        status=TransferRequestStatus.ACCEPTED,
+        reference=moved.reference,
+    )
+    return moved
 
 
 def parent_dashboard(guardian):

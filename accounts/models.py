@@ -19,7 +19,7 @@ from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .identifiers import canonical_username, normalize_email, normalize_phone, try_normalize_phone
@@ -524,6 +524,28 @@ class TransferSide(models.TextChoices):
         )
 
 
+class TransferRoute(models.TextChoices):
+    """How a transfer came to happen — and therefore what this row is evidence of.
+
+    Set by the code path that wrote the row, never by a caller: neither
+    `request_transfer_as()` nor `transfer_student_as()` accepts it as an
+    argument, so a row cannot claim to be something it is not. The check
+    constraints below make the same guarantee at the database level, so it holds
+    against a shell session and a data migration too.
+
+    HANDSHAKE     Two schools agreed. Two distinct signatories, `requested_side`
+                  says who spoke first, and the row passed through `pending`.
+    SINGLE_PARTY  One actor held authority at both ends and did the whole thing
+                  through `services.transfer_student_as()`. There was never a
+                  second party, so the row names one person twice and has no
+                  side — and says so rather than dressing itself up as consent
+                  that nobody gave.
+    """
+
+    HANDSHAKE = "handshake", "Agreed between two schools"
+    SINGLE_PARTY = "single_party", "Carried out by one authority"
+
+
 class TransferRequestStatus(models.TextChoices):
     PENDING = "pending", "Pending"
     ACCEPTED = "accepted", "Accepted"
@@ -612,20 +634,38 @@ class TransferRequest(models.Model):
     #: Which end asked. Not derivable after the fact: an admin can hold
     #: authority at both schools, and by the time anyone reads this row the
     #: memberships that granted it may have changed.
-    requested_side = models.CharField(max_length=16, choices=TransferSide)
+    #:
+    #: Null on a SINGLE_PARTY row, and null rather than a default, because there
+    #: was no side: one actor held both ends. Writing RELEASING there to avoid a
+    #: nullable column would be inventing a fact, and this table's whole purpose
+    #: is to be believed. A constraint below ties the two fields together.
+    requested_side = models.CharField(
+        max_length=16, choices=TransferSide, null=True, blank=True
+    )
     requested_at = models.DateTimeField(auto_now_add=True)
 
-    #: Who gave the second signature, and when. Null while pending, and set for
-    #: a decline or a withdrawal too — "who said no" is as much a part of the
-    #: record as who said yes.
-    answered_by = models.ForeignKey(
+    #: Whether two schools agreed or one authority acted alone. See TransferRoute.
+    route = models.CharField(
+        max_length=16, choices=TransferRoute, default=TransferRoute.HANDSHAKE
+    )
+
+    #: Who took this out of `pending`, and when. Null while it is still open.
+    #:
+    #: "Resolved", not "answered", and the difference is load-bearing. An accept
+    #: or a decline is an *answer*, and comes from the other side of the table by
+    #: definition. A withdrawal comes from the side that asked, and may well be
+    #: the same person who asked — so a column called `answered_by` invited the
+    #: rule "these two names always differ", which is false for exactly that
+    #: case. The constraint below states the narrower thing that is actually
+    #: true: an *answered* transfer names two people.
+    resolved_by = models.ForeignKey(
         User,
         related_name="transfer_requests_answered",
         on_delete=models.PROTECT,
         null=True,
         blank=True,
     )
-    answered_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
 
     status = models.CharField(
         max_length=16, choices=TransferRequestStatus, default=TransferRequestStatus.PENDING
@@ -653,6 +693,58 @@ class TransferRequest(models.Model):
                 fields=["student"],
                 condition=Q(status="pending"),
                 name="one_pending_transfer_request_per_student",
+            ),
+            # The next four are what stop a row lying about how it came about.
+            # Application code already writes `route` itself rather than taking
+            # it from a caller, but "the only code that writes this is careful"
+            # is a property of today's code; these are properties of the table.
+            #
+            # An answered handshake names two different people. This is
+            # `SameSignatory` again, one layer down — and the layer that also
+            # catches a shell session, a data migration, or a future endpoint
+            # that forgets.
+            #
+            # Scoped to accepted and declined, which are the outcomes that claim
+            # something about the *other* school. A withdrawal is the asking
+            # side retracting its own proposal, so it names its own people and
+            # frequently the very person who asked; demanding two names there
+            # would forbid the most ordinary thing a school can do with a
+            # request it no longer wants.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.SINGLE_PARTY)
+                | Q(
+                    status__in=[
+                        TransferRequestStatus.PENDING,
+                        TransferRequestStatus.WITHDRAWN,
+                    ]
+                )
+                | (
+                    Q(resolved_by__isnull=False)
+                    & ~Q(requested_by=F("resolved_by"))
+                ),
+                name="answered_transfer_names_two_signatories",
+            ),
+            # A single-party row names one person, twice, and never nobody: it
+            # is written only after the transfer has happened, so an unanswered
+            # one would describe an event with no author.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.HANDSHAKE)
+                | (Q(resolved_by__isnull=False) & Q(requested_by=F("resolved_by"))),
+                name="single_party_transfer_names_one_signatory",
+            ),
+            # ...and only after it succeeded, so it is never pending, declined
+            # or withdrawn. There was no proposal to answer.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.HANDSHAKE)
+                | Q(status=TransferRequestStatus.ACCEPTED),
+                name="single_party_transfer_is_always_accepted",
+            ),
+            # A side is exactly the thing a single-party transfer does not have,
+            # and exactly the thing a handshake must record.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.HANDSHAKE, requested_side__isnull=False)
+                | Q(route=TransferRoute.SINGLE_PARTY, requested_side__isnull=True),
+                name="transfer_side_matches_route",
             ),
         ]
         indexes = [
@@ -713,8 +805,8 @@ class TransferRequest(models.Model):
             # Bring the caller's object in line with what the lock read, so it
             # stops asserting the state this transaction has just disproved.
             self.status = locked.status
-            self.answered_by_id = locked.answered_by_id
-            self.answered_at = locked.answered_at
+            self.resolved_by_id = locked.resolved_by_id
+            self.resolved_at = locked.resolved_at
             raise TransferAlreadyResolved(
                 f"This transfer request was already "
                 f"{locked.get_status_display().lower()}."
@@ -723,10 +815,10 @@ class TransferRequest(models.Model):
 
     def _record_answer(self, by, status, *, extra_fields=()):
         self.status = status
-        self.answered_by = by
-        self.answered_at = timezone.now()
+        self.resolved_by = by
+        self.resolved_at = timezone.now()
         self.save(
-            update_fields=["status", "answered_by", "answered_at", *extra_fields]
+            update_fields=["status", "resolved_by", "resolved_at", *extra_fields]
         )
         return self
 

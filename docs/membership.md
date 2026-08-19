@@ -203,6 +203,36 @@ would put a lie in the record this table exists to be; it simply drops out of
 `transfers_awaiting()`, which filters on the enrolment still being live. Status and queue
 answer different questions, and neither is allowed to fake the other's answer.
 
+**Every transfer leaves a row, not just the handshakes.**
+`services.transfer_student_as()` writes one too, marked `SINGLE_PARTY`: one actor held
+both ends, so the row names that person as both signatures and carries no side. Without it
+the table would have logged only the moves that went through a handshake, which is the
+wrong half — the transfers with the least independent oversight would have been the ones
+with no record. `route` distinguishes the two, and it is not forgeable in either
+direction:
+
+- no entry point takes `route` as an argument, so it follows from which function ran;
+- an accepted or declined handshake row must name **two different** people;
+- a single-party row must name **one** person twice, must be `accepted`, and must carry
+  **no** side;
+- a handshake row must carry a side.
+
+The last four are `CheckConstraint`s, so relabelling an existing row either way fails in
+Postgres, not merely in a code path that a shell session or a data migration could walk
+around. `SameSignatory` and the two-signatory constraint say the same thing at different
+layers on purpose.
+
+The one place two identical names are correct is a **withdrawal** — the asking side
+retracting its own proposal, often by the very person who made it. That is why the column
+is `resolved_by` rather than `answered_by`: an accept or a decline is an answer and comes
+from the other side by definition, a withdrawal is neither, and the misleading name bought
+a constraint that forbade ordinary withdrawals until Postgres rejected one.
+
+The primitive `transfer_student()` still records nothing, and deliberately: it takes no
+actor, so there is no signature to record, and inventing an author would be worse than the
+gap. It is for imports and fixtures — anything driven by a request goes through an `_as`
+function, which is the same split the rest of `services.py` already documents.
+
 There is no HTTP surface for any of this yet — it is a service-layer flow, like
 `release_student_as()` beside it.
 

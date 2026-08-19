@@ -12,7 +12,11 @@ a handshake, and the failure would be invisible in the data: the transfer would
 be correct, and only the record would quietly be worth less than it claims.
 """
 
+import inspect
+
+from django.db import IntegrityError, transaction
 from django.test import TestCase
+from django.utils import timezone
 
 from accounts import services, transfers
 from accounts.models import (
@@ -23,6 +27,7 @@ from accounts.models import (
     Role,
     TransferRequest,
     TransferRequestStatus,
+    TransferRoute,
     TransferSide,
     User,
 )
@@ -113,8 +118,8 @@ class TheRecordTests(HandshakeSetUp):
         self.assertEqual(request.requested_by, self.stmarys_admin)
         self.assertEqual(request.requested_side, TransferSide.RELEASING)
         self.assertIsNotNone(request.requested_at)
-        self.assertEqual(request.answered_by, self.grace_admin)
-        self.assertIsNotNone(request.answered_at)
+        self.assertEqual(request.resolved_by, self.grace_admin)
+        self.assertIsNotNone(request.resolved_at)
         self.assertEqual(request.status, TransferRequestStatus.ACCEPTED)
         self.assertEqual(request.note, "Family relocating.")
 
@@ -139,8 +144,8 @@ class TheRecordTests(HandshakeSetUp):
 
         request.refresh_from_db()
         self.assertEqual(request.status, TransferRequestStatus.DECLINED)
-        self.assertEqual(request.answered_by, self.grace_admin)
-        self.assertIsNotNone(request.answered_at)
+        self.assertEqual(request.resolved_by, self.grace_admin)
+        self.assertIsNotNone(request.resolved_at)
 
 
 class TwoSignaturesOrNothingTests(HandshakeSetUp):
@@ -270,7 +275,7 @@ class OneOpenRequestTests(HandshakeSetUp):
 
         transfers.withdraw_transfer_as(colleague, request)
         request.refresh_from_db()
-        self.assertEqual(request.answered_by, colleague)
+        self.assertEqual(request.resolved_by, colleague)
 
 
 class AnsweringTwiceTests(HandshakeSetUp):
@@ -309,7 +314,7 @@ class TheEnrolmentMovedOnTests(HandshakeSetUp):
         # The request keeps its honest status: nobody declined it.
         request.refresh_from_db()
         self.assertEqual(request.status, TransferRequestStatus.PENDING)
-        self.assertIsNone(request.answered_by)
+        self.assertIsNone(request.resolved_by)
 
     def test_a_stale_request_drops_out_of_the_queue_it_can_never_be_answered_from(self):
         request = transfers.request_transfer_as(
@@ -375,3 +380,221 @@ class WhatCannotBeTransferredTests(HandshakeSetUp):
             transfers.request_transfer_as(
                 self.stmarys_admin, self.child, self.grace
             )
+
+
+class EveryTransferLeavesARecordTests(HandshakeSetUp):
+    """`TransferRequest` logs transfers, not just handshakes.
+
+    Before this, `transfer_student_as()` wrote nothing, so the table recorded
+    only the moves that had gone through a handshake — precisely the wrong half.
+    The transfers with the least independent oversight, one person acting at both
+    ends with nobody to disagree, were the ones with no record at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.operator = make_user("ops", "Ops Person", is_platform_staff=True)
+
+    def test_a_single_party_transfer_writes_its_own_row(self):
+        moved = services.transfer_student_as(self.operator, self.child, self.grace)
+
+        record = TransferRequest.objects.get()
+        self.assertEqual(record.route, TransferRoute.SINGLE_PARTY)
+        self.assertEqual(record.student, self.child)
+        self.assertEqual(record.to_school, self.grace)
+        self.assertEqual(record.status, TransferRequestStatus.ACCEPTED)
+        self.assertEqual(record.reference, moved.reference)
+
+        # One person, named twice, and no side — because there was no second
+        # party and therefore no first mover.
+        self.assertEqual(record.requested_by, self.operator)
+        self.assertEqual(record.resolved_by, self.operator)
+        self.assertIsNone(record.requested_side)
+
+    def test_a_no_op_transfer_records_nothing(self):
+        """Moving a child to the school they are already at is not an event."""
+        services.transfer_student_as(self.operator, self.child, self.stmarys)
+        self.assertEqual(TransferRequest.objects.count(), 0)
+
+    def test_both_routes_leave_exactly_one_row_each(self):
+        request = transfers.request_transfer_as(
+            self.stmarys_admin, self.child, self.grace
+        )
+        transfers.accept_transfer_as(self.grace_admin, request)
+        services.transfer_student_as(self.operator, self.child.user.student_membership(), self.hillside)
+
+        routes = list(
+            TransferRequest.objects.order_by("requested_at").values_list(
+                "route", flat=True
+            )
+        )
+        self.assertEqual(
+            routes, [TransferRoute.HANDSHAKE, TransferRoute.SINGLE_PARTY]
+        )
+
+    def test_the_primitive_still_records_nothing(self):
+        """`transfer_student()` takes no actor, so it has no signature to record.
+
+        Documented rather than fixed: the primitives are for imports, fixtures
+        and internal calls, and inventing an author for them would be worse than
+        the gap. Anything driven by a request goes through an `_as` function.
+        """
+        services.transfer_student(self.child, self.grace)
+        self.assertEqual(TransferRequest.objects.count(), 0)
+
+
+class TheRouteCannotBeForgedTests(HandshakeSetUp):
+    """A row cannot claim to be a kind of transfer it was not.
+
+    Two directions to close, and both are closed twice — once in the code paths
+    that write the column, and once in the database, so the guarantee survives a
+    shell session, a data migration, or a future endpoint that forgets.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.operator = make_user("ops", "Ops Person", is_platform_staff=True)
+
+    # -- the caller never picks the route ------------------------------------
+
+    def test_neither_entry_point_takes_a_route_argument(self):
+        for func in (
+            transfers.request_transfer_as,
+            transfers.accept_transfer_as,
+            transfers.decline_transfer_as,
+            transfers.withdraw_transfer_as,
+            services.transfer_student_as,
+        ):
+            with self.subTest(func=func.__name__):
+                self.assertNotIn(
+                    "route", inspect.signature(func).parameters,
+                    "the route must follow from which function ran, not from an argument",
+                )
+
+    def test_a_route_kwarg_is_refused_rather_than_passed_through(self):
+        """`transfer_student_as(**kwargs)` must not be a back door into the column."""
+        with self.assertRaises(TypeError):
+            services.transfer_student_as(
+                self.operator, self.child, self.grace, route=TransferRoute.HANDSHAKE
+            )
+
+    # -- a two-party transfer cannot be dressed as single-party --------------
+
+    def test_a_handshake_row_cannot_be_relabelled_single_party(self):
+        request = transfers.request_transfer_as(
+            self.stmarys_admin, self.child, self.grace
+        )
+        transfers.accept_transfer_as(self.grace_admin, request)
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TransferRequest.objects.filter(pk=request.pk).update(
+                    route=TransferRoute.SINGLE_PARTY
+                )
+
+    def test_a_single_party_row_cannot_name_two_people(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TransferRequest.objects.create(
+                    student=self.child,
+                    to_school=self.grace,
+                    requested_by=self.stmarys_admin,
+                    resolved_by=self.grace_admin,
+                    resolved_at=timezone.now(),
+                    requested_side=None,
+                    route=TransferRoute.SINGLE_PARTY,
+                    status=TransferRequestStatus.ACCEPTED,
+                )
+
+    # -- a single-party transfer cannot be dressed as a handshake ------------
+
+    def test_a_single_party_row_cannot_be_relabelled_a_handshake(self):
+        services.transfer_student_as(self.operator, self.child, self.grace)
+        record = TransferRequest.objects.get()
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TransferRequest.objects.filter(pk=record.pk).update(
+                    route=TransferRoute.HANDSHAKE
+                )
+
+    def test_an_accepted_handshake_row_cannot_name_one_person_twice(self):
+        """`SameSignatory` one layer down, where no code path can skip it."""
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TransferRequest.objects.create(
+                    student=self.child,
+                    to_school=self.grace,
+                    requested_by=self.operator,
+                    resolved_by=self.operator,
+                    resolved_at=timezone.now(),
+                    requested_side=TransferSide.RELEASING,
+                    route=TransferRoute.HANDSHAKE,
+                    status=TransferRequestStatus.ACCEPTED,
+                )
+
+    # -- and the shapes that would make either claim incoherent --------------
+
+    def test_a_single_party_row_is_never_unresolved(self):
+        for status in (
+            TransferRequestStatus.PENDING,
+            TransferRequestStatus.DECLINED,
+            TransferRequestStatus.WITHDRAWN,
+        ):
+            with self.subTest(status=status):
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        TransferRequest.objects.create(
+                            student=self.child,
+                            to_school=self.grace,
+                            requested_by=self.operator,
+                            resolved_by=self.operator,
+                            resolved_at=timezone.now(),
+                            requested_side=None,
+                            route=TransferRoute.SINGLE_PARTY,
+                            status=status,
+                        )
+
+    def test_a_single_party_row_cannot_carry_a_side(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TransferRequest.objects.create(
+                    student=self.child,
+                    to_school=self.grace,
+                    requested_by=self.operator,
+                    resolved_by=self.operator,
+                    resolved_at=timezone.now(),
+                    requested_side=TransferSide.RELEASING,
+                    route=TransferRoute.SINGLE_PARTY,
+                    status=TransferRequestStatus.ACCEPTED,
+                )
+
+    def test_a_handshake_row_must_carry_a_side(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TransferRequest.objects.create(
+                    student=self.child,
+                    to_school=self.grace,
+                    requested_by=self.stmarys_admin,
+                    requested_side=None,
+                    route=TransferRoute.HANDSHAKE,
+                    status=TransferRequestStatus.PENDING,
+                )
+
+    def test_a_withdrawal_may_name_the_person_who_asked(self):
+        """The one place two identical names are correct, and must stay allowed.
+
+        A withdrawal is the asking side retracting its own proposal. Requiring
+        two distinct names here would forbid the most ordinary thing a school
+        can do with a request it no longer wants — and it was the constraint
+        getting exactly this wrong that showed `answered_by` was the wrong name
+        for a column that also records withdrawals.
+        """
+        request = transfers.request_transfer_as(
+            self.stmarys_admin, self.child, self.grace
+        )
+        transfers.withdraw_transfer_as(self.stmarys_admin, request)
+
+        request.refresh_from_db()
+        self.assertEqual(request.status, TransferRequestStatus.WITHDRAWN)
+        self.assertEqual(request.requested_by, request.resolved_by)
