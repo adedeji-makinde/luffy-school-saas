@@ -27,7 +27,7 @@ from ninja.security import django_auth
 
 from accounts.services import NotPermitted
 from schools import invitations as invitation_service
-from schools.delivery import NoDeliveryAddress
+from schools.delivery import DeliveryNotConfigured, NoDeliveryAddress
 from schools.models import (
     Invitation,
     InvitationError,
@@ -137,12 +137,13 @@ def create_invitation(request, slug: str, payload: InviteIn):
             email=payload.email,
             phone=payload.phone,
             full_name=payload.full_name,
-            # The link the invitee clicks. A frontend route, not this API —
-            # the token is handed to the channel and never returned in the
-            # response, so an admin cannot read it back out of the API either.
-            accept_url_for=lambda token: request.build_absolute_uri(
-                f"/invitations/{token}/"
-            ),
+            # No `accept_url_for` here on purpose. The link the invitee clicks
+            # is a frontend route, not this API, and it now comes from
+            # `settings.INVITATION_ACCEPT_URL` rather than from this request.
+            # Building it with `request.build_absolute_uri()` made the origin of
+            # a live credential depend on which host the admin was signed in on
+            # — the portal host and a school's own host produced different
+            # links for the same flow, and `TenantMainMiddleware` resolves both.
         )
     except NotPermitted as exc:
         raise HttpError(403, str(exc))
@@ -158,6 +159,12 @@ def create_invitation(request, slug: str, payload: InviteIn):
         raise HttpError(409, str(exc))
     except (InvitationError, NoDeliveryAddress) as exc:
         raise HttpError(400, str(exc))
+    except DeliveryNotConfigured as exc:
+        # 503, not 400 or 500: nothing is wrong with the request and nothing is
+        # wrong at this school. The platform has no accept URL or no mail host,
+        # so no invitation can be issued by anyone until an operator sets one.
+        # Raised before the transaction committed, so nothing was left behind.
+        raise HttpError(503, str(exc))
     return 201, InvitationOut.of(invitation)
 
 
@@ -187,14 +194,15 @@ def resend_invitation(request, slug: str, invitation_id: int):
         fresh, _raw_token = invitation_service.resend_invitation(
             request.user,
             invitation,
-            accept_url_for=lambda token: request.build_absolute_uri(
-                f"/invitations/{token}/"
-            ),
+            # Same as issuing: the accept link comes from settings, not from
+            # whichever host this admin happened to be on.
         )
     except NotPermitted as exc:
         raise HttpError(403, str(exc))
     except NoDeliveryAddress as exc:
         raise HttpError(400, str(exc))
+    except DeliveryNotConfigured as exc:
+        raise HttpError(503, str(exc))
     except InvitationError as exc:
         # AlreadyAccepted and MembershipNotOpen both land here, and so does
         # anything else the flow refuses on state grounds — which is what this

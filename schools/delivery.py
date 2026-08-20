@@ -29,6 +29,21 @@ class NoDeliveryAddress(Exception):
     """The invitee has no address the selected channel can reach."""
 
 
+class DeliveryNotConfigured(Exception):
+    """This deploy cannot send invitations at all.
+
+    About the *installation*, not about the invitee — which is the whole reason
+    it is not a `NoDeliveryAddress`. Nobody can be invited until somebody fixes
+    a setting, so the answer to the admin who tried is "this platform is not
+    finished being set up", not "that person is unreachable".
+
+    Deliberately not an `InvitationError` either. That hierarchy means "the flow
+    refuses this request on state grounds", and `api.py` maps it to 4xx: the
+    caller did something that cannot be done. This is the opposite — the request
+    was fine and the server is not.
+    """
+
+
 class Channel:
     """The seam. Implement `send()` and register the path in settings.
 

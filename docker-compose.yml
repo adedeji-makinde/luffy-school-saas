@@ -13,6 +13,14 @@ services:
       # SMTP so that a deploy which never sets this fails loudly instead of
       # printing live invitation tokens to the application log.
       EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
+      # Where the invitation accept page lives. settings.py has no default for
+      # this on purpose — every candidate default is wrong somewhere, and the
+      # one it replaced (build it from the issuing admin's request host) is the
+      # bug the setting exists to remove. There is no frontend in this repo yet,
+      # so the development value is a placeholder origin that is obviously not a
+      # real one; it makes the link deterministic and inspectable in the console
+      # backend's output without pretending to resolve.
+      INVITATION_ACCEPT_URL: http://localhost:3000/invitations/{token}/
     depends_on:
       - db
     

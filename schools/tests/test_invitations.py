@@ -23,7 +23,7 @@ from accounts.deletion import deactivate_user, reactivate_user
 from accounts.models import Membership, MembershipStatus, Role, User
 from accounts.services import NotPermitted, grant_membership
 from schools import invitations as invitation_service
-from schools.delivery import EmailChannel, NoDeliveryAddress
+from schools.delivery import DeliveryNotConfigured, EmailChannel, NoDeliveryAddress
 from schools.models import (
     Invitation,
     InvitationError,
@@ -68,6 +68,17 @@ def recording():
     )
 
 
+#: What a deploy that has been set up looks like. `settings.INVITATION_ACCEPT_URL`
+#: has no default — see settings.py — so without this every test below would be
+#: exercising an unconfigured platform, which is one specific case rather than
+#: the ordinary one. `AcceptUrlTests` overrides it back off to pin that case.
+#:
+#: On the class rather than in each test: Django applies a subclass's inherited
+#: `_overridden_settings`, so every `InvitationSetUp` subclass gets it.
+ACCEPT_URL = "https://portal.example.school/invitations/{token}/"
+
+
+@override_settings(INVITATION_ACCEPT_URL=ACCEPT_URL)
 class InvitationSetUp(TestCase):
     def setUp(self):
         self.stmarys = make_school("St Mary's", "st-marys", "st_marys")
@@ -760,6 +771,137 @@ class DeliveryTests(InvitationSetUp):
 
         self.assertEqual(RecordingChannel.sent[-1]["raw_token"], raw_token)
         self.assertEqual(Invitation.validate_token(raw_token), invitation)
+
+
+class AcceptUrlTests(InvitationSetUp):
+    """Where the link in the mail points, and who decides.
+
+    It used to be `request.build_absolute_uri()` at two API call sites, which
+    made the origin of a live credential a property of whichever host the
+    issuing admin was signed in on, for a page that lives on a frontend which
+    may be on neither host. `settings.INVITATION_ACCEPT_URL` is now the single
+    place that decides, and the host-independence half of that is pinned over in
+    `test_invitation_api.py` where there is a request to have a host at all.
+    """
+
+    def counts(self):
+        return (
+            Invitation.objects.count(),
+            User.objects.count(),
+            Membership.objects.count(),
+        )
+
+    def test_the_link_is_built_from_settings_when_the_caller_passes_none(self):
+        with recording():
+            with self.captureOnCommitCallbacks(execute=True):
+                _invitation, raw_token = invitation_service.invite_staff(
+                    self.admin,
+                    self.stmarys,
+                    Role.TEACHER,
+                    email="new.teacher@example.com",
+                    full_name="New Teacher",
+                )
+
+        self.assertEqual(
+            RecordingChannel.sent[-1]["accept_url"],
+            f"https://portal.example.school/invitations/{raw_token}/",
+        )
+
+    def test_an_explicit_accept_url_still_overrides_the_setting(self):
+        """The parameter survives as an override, which is what tests use."""
+        with recording():
+            with self.captureOnCommitCallbacks(execute=True):
+                _invitation, raw_token = self.invite()
+
+        self.assertEqual(
+            RecordingChannel.sent[-1]["accept_url"], f"https://portal/i/{raw_token}/"
+        )
+
+    def test_an_unconfigured_accept_url_refuses_and_leaves_nothing_behind(self):
+        """The reason the check runs before the transaction commits.
+
+        A deploy that never sets the URL is a misconfiguration, and refusing is
+        the right answer — but refusing *after* the placeholder account, the
+        INVITED membership and the invitation had committed would have meant one
+        more orphaned set per attempt, which is exactly what `_deliver()`'s
+        pre-commit checks exist to prevent.
+        """
+        before = self.counts()
+        with recording():
+            with override_settings(INVITATION_ACCEPT_URL=None):
+                with self.assertRaises(DeliveryNotConfigured):
+                    with self.captureOnCommitCallbacks(execute=True):
+                        invitation_service.invite_staff(
+                            self.admin,
+                            self.stmarys,
+                            Role.TEACHER,
+                            email="new.teacher@example.com",
+                        )
+
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(RecordingChannel.sent, [])
+
+    def test_a_template_with_no_token_placeholder_is_refused(self):
+        """Otherwise every invitation ever sent carries the same link."""
+        before = self.counts()
+        with recording():
+            with override_settings(
+                INVITATION_ACCEPT_URL="https://portal.example.school/invitations/"
+            ):
+                with self.assertRaises(DeliveryNotConfigured):
+                    with self.captureOnCommitCallbacks(execute=True):
+                        invitation_service.invite_staff(
+                            self.admin,
+                            self.stmarys,
+                            Role.TEACHER,
+                            email="new.teacher@example.com",
+                        )
+
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(RecordingChannel.sent, [])
+
+    def test_omitting_the_url_no_longer_mints_a_token_and_sends_nothing(self):
+        """The silent no-op, pinned as refused.
+
+        `_deliver()` used to return early when `accept_url_for` was None —
+        minting a live token, skipping `check_deliverable()` entirely and
+        delivering nothing, with a successful return value. Any caller that
+        forgot the keyword produced a placeholder account and a dead token in
+        silence. There is now no way to reach that: with the setting configured
+        the link is built from it, and with the setting missing the invite is
+        refused above.
+        """
+        before = self.counts()
+        with recording():
+            with override_settings(INVITATION_ACCEPT_URL=None):
+                with self.assertRaises(DeliveryNotConfigured):
+                    invitation_service.invite_staff(
+                        self.admin,
+                        self.stmarys,
+                        Role.TEACHER,
+                        email="silent@example.com",
+                        accept_url_for=None,
+                    )
+
+        self.assertEqual(self.counts(), before)
+        self.assertFalse(
+            User.objects.filter(email="silent@example.com").exists(),
+            "a refused invite must not leave a placeholder account behind",
+        )
+
+    def test_a_resend_takes_its_link_from_the_same_setting(self):
+        with recording():
+            with self.captureOnCommitCallbacks(execute=True):
+                invitation, _raw = self.invite()
+            with self.captureOnCommitCallbacks(execute=True):
+                _fresh, resent_token = invitation_service.resend_invitation(
+                    self.admin, invitation
+                )
+
+        self.assertEqual(
+            RecordingChannel.sent[-1]["accept_url"],
+            f"https://portal.example.school/invitations/{resent_token}/",
+        )
 
 
 class InviteeResolutionTests(InvitationSetUp):

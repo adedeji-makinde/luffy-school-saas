@@ -12,13 +12,16 @@ direction of "create a new account" is how a teacher ends up with two logins and
 a parent loses sight of one of their children.
 """
 
+from urllib.parse import quote
+
+from django.conf import settings
 from django.db import transaction
 
 from accounts.identifiers import normalize_email, try_normalize_phone
 from accounts.models import Membership, MembershipStatus, Role, STAFF_ROLES, User
 from accounts.services import NotPermitted, _require_grant_authority, grant_membership
 
-from .delivery import get_channel
+from .delivery import DeliveryNotConfigured, get_channel
 from .models import Invitation, InvitationError, InviteeDeactivated
 
 # `InvitationError` is deliberately imported rather than defined here. This
@@ -304,6 +307,48 @@ def _issue(membership, actor, *, ttl=None):
     return Invitation.create_with_token(membership, actor, **kwargs)
 
 
+def configured_accept_url(raw_token):
+    """The link that redeems `raw_token`, built from `INVITATION_ACCEPT_URL`.
+
+    One setting, read here, used by every path that delivers an invitation —
+    which is the point. The two API call sites each built this themselves out of
+    `request.build_absolute_uri()`, so the origin of a live credential was
+    whichever host the *issuing admin* was signed in on. `TenantMainMiddleware`
+    resolves the portal host and a school's own host differently, so inviting
+    the same teacher from two places produced links on two different origins,
+    for a page that lives on a frontend which may be on neither and which no
+    urlconf here serves. Nothing pinned the path either: the service tests used
+    `https://portal/i/{token}/` and `api.py` emitted `/invitations/{token}/`.
+
+    Refused rather than defaulted when the setting is missing or malformed. The
+    honest defaults are all wrong — a hard-coded origin is wrong for every
+    deploy but one, and falling back to the request host is the bug being fixed.
+    Refusing *here* is what makes it safe: this runs inside `invite_staff()`'s
+    still-open transaction, so a misconfigured deploy creates no placeholder
+    account, no INVITED membership and no undeliverable invitation on the way to
+    reporting itself.
+    """
+    template = getattr(settings, "INVITATION_ACCEPT_URL", None)
+    if not template:
+        raise DeliveryNotConfigured(
+            "No INVITATION_ACCEPT_URL is configured, so there is no address to "
+            "put in an invitation. Set it to the accept page's URL with a "
+            "{token} placeholder, e.g. "
+            "https://portal.luffy.school/invitations/{token}/."
+        )
+    if "{token}" not in template:
+        raise DeliveryNotConfigured(
+            f"INVITATION_ACCEPT_URL ({template!r}) has no {{token}} placeholder, "
+            f"so every invitation would be sent the same link. Include {{token}} "
+            f"where the token belongs."
+        )
+    # `secrets.token_urlsafe()` only ever produces characters that are already
+    # safe in both a path segment and a query value, so this changes nothing
+    # today. It is here so that the setting can put the token in a query string
+    # without the escaping question being reopened.
+    return template.format(token=quote(raw_token, safe=""))
+
+
 def _deliver(invitation, raw_token, accept_url_for):
     """Hand the raw token to the configured channel.
 
@@ -321,10 +366,23 @@ def _deliver(invitation, raw_token, accept_url_for):
     What remains post-commit is genuine infrastructure failure (an SMTP outage),
     where the row surviving is the right outcome: the invitation exists and can
     be resent once the channel is healthy.
+
+    `accept_url_for` is an override, not a requirement. It used to be neither:
+    passing nothing returned early — minting a live token, skipping
+    `check_deliverable()` and delivering nothing, with a successful return
+    value. Any caller that forgot the keyword (a management command, an import)
+    produced a placeholder account and a dead token in silence. The default is
+    now the configured URL, so the way to send nothing is to configure nothing,
+    and that refuses out loud.
     """
-    if accept_url_for is None:
-        return
     channel = get_channel()
+
+    # Configuration before people, when both are wrong. "This platform has no
+    # accept URL" is the more useful answer than "that teacher has no email
+    # address": the first is true for everybody and blocks the admin's next
+    # attempt too, while the second is one row they can fix by typing.
+    build_url = accept_url_for or configured_accept_url
+    accept_url = build_url(raw_token)
 
     # Optional half of the seam — a test double, or any channel that cannot
     # answer without sending, simply does not define it. See delivery.Channel.
@@ -332,7 +390,6 @@ def _deliver(invitation, raw_token, accept_url_for):
     if check_deliverable is not None:
         check_deliverable(invitation)
 
-    accept_url = accept_url_for(raw_token)
     transaction.on_commit(
         lambda: channel.send(invitation, raw_token, accept_url=accept_url)
     )
@@ -368,6 +425,7 @@ __all__ = [
     "AlreadyAMember",
     "AlreadyAccepted",
     "AmbiguousInvitee",
+    "DeliveryNotConfigured",
     "InvitationError",
     "InviteeDeactivated",
     "MembershipNotOpen",
@@ -375,6 +433,7 @@ __all__ = [
     "NotStaffRole",
     "Role",
     "active_staff",
+    "configured_accept_url",
     "invite_staff",
     "pending_invitations",
     "resend_invitation",

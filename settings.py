@@ -91,6 +91,26 @@ INVITATION_CHANNEL = os.environ.get(
     "INVITATION_CHANNEL", "schools.delivery.EmailChannel"
 )
 
+#: Where the accept page lives, as a template containing `{token}`.
+#:
+#: This used to be built with `request.build_absolute_uri()` at the two API call
+#: sites, which made the origin of a live credential a property of *whichever
+#: host the issuing admin happened to be signed in on*. `TenantMainMiddleware`
+#: resolves the portal host and a school's own host differently, so the same
+#: flow emitted `http://testserver/invitations/...` or
+#: `http://stmarys.luffy.school/invitations/...` depending on where the admin was
+#: standing — for a page that is meant to live on a frontend which may be on
+#: neither of them, and which no urlconf in this project serves.
+#:
+#: There is deliberately **no default**. Every candidate default is wrong
+#: somewhere: a hard-coded origin is wrong for every deploy that is not ours, and
+#: falling back to the request host is the bug this setting exists to remove. So
+#: an unset value is a misconfiguration and is refused — see
+#: `invitations.configured_accept_url()`, which raises *before* the transaction
+#: commits, so a deploy that never sets this creates no orphaned placeholder
+#: accounts while failing.
+INVITATION_ACCEPT_URL = os.environ.get("INVITATION_ACCEPT_URL")
+
 #: Not the console backend, which is what this used to default to. An invite
 #: link is a live credential, and the console backend writes the whole message
 #: — accept URL, token and all — to stdout, which in a container is the
