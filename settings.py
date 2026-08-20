@@ -135,6 +135,71 @@ TEMPLATES = [
     }
 ]
 
+# ---------------------------------------------------------------------------
+# Logging
+#
+# Every line says which school it is about. On a platform whose entire shape is
+# one schema per customer, "IntegrityError on membership save" is the same line
+# from St Mary's and from Grace Academy, and the log could not tell them apart —
+# so the first question anybody asks of an incident was the one question it
+# could not answer.
+#
+# `SchoolContextFilter` reads the *connection*, not the request, so this is
+# still right in a management command, a migration and an `on_commit` callback,
+# where there is no request to read. It is attached to every handler rather than
+# to the loggers, because a filter on a logger does not apply to records that
+# propagate up from its children — and the lines worth labelling most are
+# Django's own (`django.request`) and third-party ones, which nobody can go and
+# edit a call site for.
+#
+# See schools/logging.py.
+# ---------------------------------------------------------------------------
+LOGGING = {
+    "version": 1,
+    # Emphatically not True. Django configures `django` and `django.server`
+    # before this runs, and disabling existing loggers silences them for the
+    # life of the process — including the request logger this section exists to
+    # label.
+    "disable_existing_loggers": False,
+    "filters": {
+        "school": {"()": "schools.logging.SchoolContextFilter"},
+        "require_debug_false": {"()": "django.utils.log.RequireDebugFalse"},
+    },
+    "formatters": {
+        "school_aware": {
+            "format": "{levelname} {asctime} [{school}] {name} {message}",
+            "style": "{",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "filters": ["school"],
+            "formatter": "school_aware",
+        },
+        # The error report. Subclassed so the school reaches the *subject*,
+        # which is the part visible in a mailbox list of forty of them.
+        "mail_admins": {
+            "class": "schools.logging.SchoolAdminEmailHandler",
+            "level": "ERROR",
+            "filters": ["require_debug_false", "school"],
+            "include_html": True,
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": os.environ.get("LOG_LEVEL", "INFO"),
+    },
+    "loggers": {
+        "django.request": {
+            "handlers": ["console", "mail_admins"],
+            "level": "ERROR",
+            # False: the root handler would otherwise print every 500 twice.
+            "propagate": False,
+        }
+    },
+}
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = os.environ.get("TIME_ZONE", "Africa/Lagos")
