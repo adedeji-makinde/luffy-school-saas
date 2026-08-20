@@ -265,6 +265,50 @@ The three options, with what each actually buys:
 Whoever picks up the next tenant-scoped model decides this first, and records
 the decision here.
 
+### Decided: option 2, forbid them — proposed with `fees.FeeLedgerEntry`
+
+**Status: proposed, not ratified.** This is a platform-wide policy being settled
+by the first model that needed an answer, so it wants a second reader. What
+follows is the reasoning; disagree with it in the PR rather than in a year.
+
+`fees.FeeLedgerEntry` is the next tenant-scoped model, and it needs to say which
+student an amount is against. It carries `student_membership_id` as a bare
+`PositiveBigIntegerField` with **no foreign key**, and `recorded_by_id` the same
+way. The three arguments that decided it, in order of weight:
+
+**1. A foreign key would not deliver the guarantee this table most needs.** The
+one thing a financial record must promise is that it cannot be destroyed as a
+side effect of somebody being removed. `PROTECT` is the mechanism you would
+reach for, and the measurements above show `PROTECT` silently does not protect
+across schemas — the query it runs to find referencing rows is resolved against
+whichever schema the connection happens to be on. `CASCADE` is worse: it would
+delete one school's books and leave every other school's pointing at nothing,
+with the breakage surfacing at `COMMIT`. So on this table the FK buys a
+guarantee that is false exactly when it matters.
+
+**2. Money has to be exportable per school.** A school's books being dumpable,
+restorable and handed over on their own is a requirement for auditors, for a
+school leaving the platform, and for anybody who has ever had to answer a
+question about last year. Option 2 is what keeps a schema self-contained.
+
+**3. It is the reversible direction.** This document already makes the
+asymmetry argument: *no FK → FK* is a cheap migration, *FK → no FK* once tenant
+data exists is not. Choosing option 2 first therefore keeps option 1 and option
+3 open; choosing either of those first closes option 2.
+
+What it costs, stated plainly rather than glossed: no database-enforced
+integrity between an entry and the membership it names, no `select_related` onto
+the student, and no reverse accessor. `FeeLedgerEntry` pays part of that back by
+**freezing the identity it needs** — `student_name` and `student_reference` are
+stored as they stood when the entry was posted, which a financial record wants
+anyway. A receipt that rewrites itself when a school corrects a spelling is not
+a receipt, so the join it is giving up is a join it should not have used.
+
+Note what this does *not* forbid: **tenant → tenant** foreign keys are fine and
+`FeeLedgerEntry` uses two of them (`term`, and `reverses` onto itself). Both
+tables live in the same schema, so none of the above applies — and `PROTECT`
+there really does protect, which a test pins.
+
 ### Half of option 3 now exists
 
 `accounts/deletion.py` is the deletion path that iterates every schema. **This

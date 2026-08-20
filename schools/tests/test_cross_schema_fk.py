@@ -101,14 +101,26 @@ class CrossSchemaForeignKeyTests(TestCase):
     # -- what Postgres was actually handed -----------------------------------
 
     def test_the_foreign_key_binds_to_public_with_no_on_delete_action(self):
-        """The DDL claim the blocker rests on, now from a real Django model."""
+        """The DDL claim the blocker rests on, now from a real Django model.
+
+        Scoped to the probe tables rather than to every foreign key in the
+        schema. It used to be the latter, which was the same thing right up
+        until a shipped tenant model gained a foreign key of its own —
+        `fees.FeeLedgerEntry` has two, both tenant→*tenant* (`term`, and
+        `reverses` onto itself), which this file has never had an opinion about.
+        `test_no_shipped_tenant_model_reaches_into_public` below is the one that
+        does, and keeping the two apart is what stops a legitimate same-schema
+        relation reading as a violation of the blocker.
+        """
         rows = query(
             "select confrelid::regclass::text, confdeltype, condeferrable, condeferred "
-            "from pg_constraint "
-            "where connamespace = 'st_marys'::regnamespace and contype = 'f' "
+            "from pg_constraint c "
+            "join pg_class t on t.oid = c.conrelid "
+            "where c.connamespace = 'st_marys'::regnamespace and c.contype = 'f' "
+            "and t.relname in ('academics_probecascade', 'academics_probeprotect') "
             "order by 1"
         )
-        self.assertTrue(rows, "expected foreign keys in the tenant schema")
+        self.assertTrue(rows, "expected the probe tables' foreign keys")
         for referenced_table, on_delete, deferrable, deferred in rows:
             # Resolves to the shared table, from inside the tenant schema.
             self.assertEqual(referenced_table, "accounts_user")
@@ -118,6 +130,49 @@ class CrossSchemaForeignKeyTests(TestCase):
             # ...and the check is deferred to COMMIT, which is what hides it.
             self.assertTrue(deferrable)
             self.assertTrue(deferred)
+
+    def test_no_shipped_tenant_model_reaches_into_public(self):
+        """The blocker's policy, enforced rather than only written down.
+
+        docs/tenancy.md now settles on **option 2**: tenant tables reference
+        shared rows by bare id and never by foreign key, because everything
+        measured in this file says a cross-schema `on_delete` does not mean what
+        it says. That decision was a paragraph in a document, which is the kind
+        of rule somebody adds a `ForeignKey` straight through without reading.
+
+        So: every foreign key in a real school's schema must point at a table in
+        *that same schema*. Tenant→tenant is fine and `fees.FeeLedgerEntry` uses
+        two of them; tenant→`public` is the thing forbidden. The probe tables are
+        excluded because breaking the rule on purpose is their entire job.
+
+        If this fails, the fix is almost certainly to replace the new foreign key
+        with a bare id column and a service-layer check — not to relax this test.
+        """
+        rows = query(
+            "select t.relname, c.conname, n.nspname "
+            "from pg_constraint c "
+            "join pg_class t on t.oid = c.conrelid "
+            "join pg_class r on r.oid = c.confrelid "
+            "join pg_namespace n on n.oid = r.relnamespace "
+            "where c.connamespace = 'st_marys'::regnamespace and c.contype = 'f' "
+            "and t.relname not in ('academics_probecascade', 'academics_probeprotect')"
+        )
+        offenders = [
+            f"{table}.{constraint} -> {schema}"
+            for table, constraint, schema in rows
+            if schema != "st_marys"
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "a tenant model has a foreign key out of its own schema; "
+            "docs/tenancy.md forbids that — use a bare id",
+        )
+        # And prove the query would have found one, rather than passing because
+        # it matched nothing at all. Checked with the probe tables let back in:
+        # both are reported, which is what makes the empty list above mean
+        # something.
+        self.assertTrue(rows, "expected some shipped tenant foreign keys to check")
 
     # -- what Django's collector can see -------------------------------------
 
