@@ -130,8 +130,111 @@ UniqueConstraint(fields=["user"], condition=Q(role="student") & ~Q(status="ended
 Two things follow. It is global rather than per-school — possible only because
 `Membership` is shared — so a second live student row *anywhere* is rejected. And
 `status="ended"` releases it, so graduations and transfers keep their history instead
-of being deleted. Use `services.transfer_student()`, which ends the old membership,
-opens the new one, and carries the guardians across.
+of being deleted.
+
+A transfer is **two one-sided acts**, because no school may write a row at another:
+
+| Act | Who calls it | Authority needed |
+| --- | --- | --- |
+| `release_student_as(actor, student)` | the school the child is leaving | that school only |
+| `enroll_student_as(actor, user, school)` | the school admitting them | that school only |
+
+`release_student_as()` takes no destination, deliberately — the moment it accepted a
+`to_school` it would be a cross-school write wearing a one-sided signature. Ending the old
+row is also what frees the one-school slot, since the partial index keys off
+`status <> 'ended'`, so the ordering is forced rather than conventional: admission before
+release is refused with `AlreadyEnrolled`, naming the school still holding the child.
+
+Guardianship rows survive a release, still pointing at the ended membership. They are the
+only record of who the child's guardians were, and the receiving school re-links them from
+it (`student.guardianships`) with `link_guardian_as()` under its own authority. What does
+not survive is the parents' *access*: a guardian with no other live child at the releasing
+school loses their PARENT membership there.
+
+`services.transfer_student_as()` is kept for platform staff and for the rare admin holding
+memberships at both schools. It does both halves in one transaction — no window, and
+guardians carried across rather than re-linked — but it is not the ordinary path, because
+requiring authority at both ends is what made ordinary transfers impossible.
+
+### The handshake
+
+Two one-sided acts move a child, but nothing connects them: no link between a release and
+the admission it was meant for, no record that anybody agreed, and a window in between
+where the child belongs to no school. `TransferRequest` is what connects them, and the
+idea fits in a sentence — **the handshake assembles two-sided authority out of two
+one-sided acts.**
+
+`transfer_student()` really does need authority at both ends. Requiring one *caller* to
+hold both is what broke ordinary transfers. So one school signs by requesting, the other
+by accepting, and only with both signatures does the transfer run — in one transaction,
+which is what closes the window. Neither side ever acted at the other's school; the pair
+of consents did.
+
+| Act | Called by | Authority needed |
+| --- | --- | --- |
+| `request_transfer_as(actor, student, to_school)` | either school | that actor's own end |
+| `accept_transfer_as(actor, request)` | the other school | the other end |
+| `decline_transfer_as(actor, request)` | the other school | the other end |
+| `withdraw_transfer_as(actor, request)` | the school that asked | its own end |
+
+Either end may ask. "We are letting this child go to Grace" and "we would like to admit
+this child from St Mary's" are one proposal seen from opposite sides, so `requested_side`
+records which it was — "who asked" is the first question anyone has when a transfer is
+disputed.
+
+**One person may not sign both halves.** Platform staff pass every authority check, and an
+admin can hold memberships at both schools, so nothing but an explicit rule stops one
+person producing a row that claims two schools agreed. `SameSignatory` is that rule. It is
+not a permissions check — the actor has already been found to hold the authority — it is a
+check on what the record *means*. Somebody who genuinely holds both ends does not need a
+handshake: `transfer_student_as()` is the one-caller path and says so in its signature.
+
+**At most one open request per enrolment**, as a partial unique index rather than an
+application check — the same spirit as the one-school slot it protects. Two open requests
+would let one admin agree to Grace and another to Hillside for the same child, and the
+second to land would find the enrolment gone. A second destination waits for the first to
+be declined or withdrawn.
+
+A request is a proposal about a relationship, and the relationship can move on while it
+sits there — the child released without a destination, graduated, moved by platform staff.
+Accepting then raises `EnrolmentMovedOn` rather than reviving an ended enrolment. Such a
+request keeps its `pending` status, because nobody declined it and rewriting the status
+would put a lie in the record this table exists to be; it simply drops out of
+`transfers_awaiting()`, which filters on the enrolment still being live. Status and queue
+answer different questions, and neither is allowed to fake the other's answer.
+
+**Every transfer leaves a row, not just the handshakes.**
+`services.transfer_student_as()` writes one too, marked `SINGLE_PARTY`: one actor held
+both ends, so the row names that person as both signatures and carries no side. Without it
+the table would have logged only the moves that went through a handshake, which is the
+wrong half — the transfers with the least independent oversight would have been the ones
+with no record. `route` distinguishes the two, and it is not forgeable in either
+direction:
+
+- no entry point takes `route` as an argument, so it follows from which function ran;
+- an accepted or declined handshake row must name **two different** people;
+- a single-party row must name **one** person twice, must be `accepted`, and must carry
+  **no** side;
+- a handshake row must carry a side.
+
+The last four are `CheckConstraint`s, so relabelling an existing row either way fails in
+Postgres, not merely in a code path that a shell session or a data migration could walk
+around. `SameSignatory` and the two-signatory constraint say the same thing at different
+layers on purpose.
+
+The one place two identical names are correct is a **withdrawal** — the asking side
+retracting its own proposal, often by the very person who made it. That is why the column
+is `resolved_by` rather than `answered_by`: an accept or a decline is an answer and comes
+from the other side by definition, a withdrawal is neither, and the misleading name bought
+a constraint that forbade ordinary withdrawals until Postgres rejected one.
+
+The primitive `transfer_student()` still records nothing, and deliberately: it takes no
+actor, so there is no signature to record, and inventing an author would be worse than the
+gap. It is for imports and fixtures — anything driven by a request goes through an `_as`
+function, which is the same split the rest of `services.py` already documents.
+
+There is no HTTP surface for any of this yet — it is a service-layer flow, like
+`release_student_as()` beside it.
 
 ## Deleting things
 
@@ -275,29 +378,23 @@ either way. Nothing about the current `User.phone`/`User.email`/
 
 ## Open items
 
-Both deliberately deferred, not overlooked. Neither is started.
+Deliberately deferred, not overlooked.
 
-**1. Transfers need a handshake.** `transfer_student_as()` requires authority at both the
-old and the new school. Since an admin normally holds authority at one school only, that
-means **an ordinary school admin can never transfer a student** — in practice every
-transfer routes through platform staff, which does not scale.
+**1. ~~Transfers need a handshake.~~ Built.** `transfer_student_as()` required authority at
+both ends, which an ordinary school admin never has, so every transfer routed through
+platform staff. Now two one-sided acts move a child (`release_student_as()` /
+`enroll_student_as()`), and `TransferRequest` connects them into a handshake that records
+both consents and runs the move in one transaction. See
+[The handshake](#the-handshake).
 
-The agreed direction is to stop treating it as one operation and split it into two
-one-sided acts: `release_student_as(actor, student)` (old school ends the membership,
-authority at the old school only) followed by the existing `enroll_student_as()` (new
-school admits). Neither school ever writes at the other, and the partial index already
-allows it — once the old row is `ended`, the slot is free. `Membership.end()` and
-`enroll_student_as()` already exist, so this is a small change with no migration.
+Rejected on principle, and still rejected: destination-only authority. It would let a
+receiving school unilaterally end a membership at a school it has no relationship with,
+which is exactly the cross-school write this model exists to prevent.
 
-Two costs to handle: guardians must be re-linked by the receiving school, and there is a
-window between release and admission where the child belongs to no school, so
-`student_membership()` returns `None`. A `TransferRequest` handshake — either side
-initiates, the other accepts, then `transfer_student()` runs — would close the window and
-record who agreed, which matters the first time a transfer is disputed.
-
-Rejected on principle: destination-only authority. It would let a receiving school
-unilaterally end a membership at a school it has no relationship with, which is exactly
-the cross-school write this model exists to prevent.
+Left open on purpose: no HTTP surface, and the unconnected two-act path still has its
+window. `release_student_as()` without a handshake is the right call when a child leaves
+for a school that is not on the platform — there is no second party to sign — so the gap
+is kept, and a test pins it rather than letting a caller assume it is not there.
 
 **2. ~~No invitation flow.~~ Built for staff; parents and students still open.**
 See [Inviting staff](#inviting-staff) below. The warning this item carried turned out to

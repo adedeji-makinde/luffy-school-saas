@@ -695,3 +695,176 @@ class SchoolAccessMiddlewareTests(TestCase):
 
         with on_host_of(self.stmarys):
             self.assertEqual(self.middleware(self.request_as(AnonymousUser())), "ok")
+
+
+class TransferAsTwoOneSidedActsTests(TestCase):
+    """A transfer neither school can perform alone, and neither needs the other for.
+
+    `transfer_student_as()` needs authority at both ends, which an ordinary
+    school admin never has — so in practice every move routed through platform
+    staff. The two-sided path splits it: the releasing school ends the enrolment
+    under its own authority, the receiving school admits under its own, and
+    neither ever writes a row at the other's school.
+    """
+
+    def setUp(self):
+        self.stmarys = make_school("St Mary's", "st-marys", "st_marys")
+        self.grace = make_school("Grace Academy", "grace", "grace")
+
+        self.stmarys_admin = make_user("admin@stmarys.ng", "Stella Admin")
+        services.grant_membership(self.stmarys_admin, self.stmarys, Role.ADMIN)
+        self.grace_admin = make_user("admin@grace.ng", "Grace Admin")
+        services.grant_membership(self.grace_admin, self.grace, Role.ADMIN)
+
+        self.parent = make_user("08031234567", "Bisi Ade", phone="08031234567")
+        self.child = services.enroll_student(
+            make_user("STM/1", "Ada Ade"), self.stmarys, reference="STM/1"
+        )
+        services.link_guardian(
+            self.parent, self.child, relationship=Relationship.MOTHER,
+            is_primary_contact=True,
+        )
+
+    def test_each_school_acts_under_its_own_authority(self):
+        """The whole point: neither admin holds authority at the other school."""
+        self.assertFalse(services.can_grant_memberships(self.stmarys_admin, self.grace))
+        self.assertFalse(services.can_grant_memberships(self.grace_admin, self.stmarys))
+
+        released = services.release_student_as(self.stmarys_admin, self.child)
+        self.assertEqual(released.status, MembershipStatus.ENDED)
+
+        admitted = services.enroll_student_as(
+            self.grace_admin, self.child.user, self.grace, reference="GA/77"
+        )
+
+        self.assertEqual(admitted.school, self.grace)
+        self.assertEqual(admitted.status, MembershipStatus.ACTIVE)
+        self.assertEqual(admitted.reference, "GA/77")
+        self.assertEqual(self.child.user.student_membership(), admitted)
+
+    def test_releasing_frees_the_one_school_slot(self):
+        """Admission is refused until the previous school lets go."""
+        with self.assertRaises(services.AlreadyEnrolled) as caught:
+            services.enroll_student_as(self.grace_admin, self.child.user, self.grace)
+        # The refusal names where the child still is, so the receiving admin
+        # knows who has to act rather than having to guess.
+        self.assertIn("St Mary's", str(caught.exception))
+
+        services.release_student_as(self.stmarys_admin, self.child)
+        services.enroll_student_as(self.grace_admin, self.child.user, self.grace)
+
+        self.assertEqual(
+            Membership.objects.filter(
+                user=self.child.user, role=Role.STUDENT
+            ).count(),
+            2,
+            "the old enrolment should survive as history, not be overwritten",
+        )
+
+    def test_a_release_does_not_write_at_any_other_school(self):
+        before = set(
+            Membership.objects.exclude(school=self.stmarys).values_list("pk", flat=True)
+        )
+        services.release_student_as(self.stmarys_admin, self.child)
+        after = set(
+            Membership.objects.exclude(school=self.stmarys).values_list("pk", flat=True)
+        )
+        self.assertEqual(before, after)
+
+    def test_a_release_drops_the_parents_access_but_keeps_the_record(self):
+        self.assertTrue(self.parent.has_access_to(self.stmarys))
+
+        services.release_student_as(self.stmarys_admin, self.child)
+
+        # Access goes: no live child keeps them at St Mary's any more.
+        self.assertFalse(self.parent.has_access_to(self.stmarys))
+        self.assertEqual(self.parent.children().count(), 0)
+
+        # The record stays. It is who this child's guardians were, and it is
+        # what the receiving school re-links them from.
+        link = Guardianship.objects.get(guardian=self.parent, student=self.child)
+        self.assertEqual(link.relationship, Relationship.MOTHER)
+        self.assertTrue(link.is_primary_contact)
+
+    def test_the_receiving_school_relinks_the_guardian_under_its_own_authority(self):
+        services.release_student_as(self.stmarys_admin, self.child)
+        admitted = services.enroll_student_as(
+            self.grace_admin, self.child.user, self.grace
+        )
+
+        previous = self.child.guardianships.select_related("guardian")
+        for link in previous:
+            services.link_guardian_as(
+                self.grace_admin,
+                link.guardian,
+                admitted,
+                relationship=link.relationship,
+                is_primary_contact=link.is_primary_contact,
+            )
+
+        self.assertTrue(self.parent.has_access_to(self.grace))
+        self.assertFalse(self.parent.has_access_to(self.stmarys))
+        self.assertEqual([c.pk for c in self.parent.children()], [admitted.pk])
+        self.assertTrue(
+            Guardianship.objects.get(
+                guardian=self.parent, student=admitted
+            ).is_primary_contact
+        )
+
+    def test_a_sibling_keeps_the_parent_at_the_releasing_school(self):
+        sibling = services.enroll_student(make_user("STM/2", "Tunde Ade"), self.stmarys)
+        services.link_guardian(self.parent, sibling)
+
+        services.release_student_as(self.stmarys_admin, self.child)
+
+        self.assertTrue(self.parent.has_access_to(self.stmarys))
+        self.assertEqual([c.pk for c in self.parent.children()], [sibling.pk])
+
+    def test_between_the_two_halves_the_child_belongs_to_no_school(self):
+        """The known cost of not writing across schools. Pinned, not hidden.
+
+        A `TransferRequest` handshake would close this window; until then a
+        caller must not assume `student_membership()` is never None for a child
+        mid-transfer.
+        """
+        services.release_student_as(self.stmarys_admin, self.child)
+
+        self.assertIsNone(self.child.user.student_membership())
+        self.assertEqual(self.parent.children().count(), 0)
+        self.assertEqual(services.parent_dashboard(self.parent), [])
+
+    def test_an_admin_cannot_release_a_child_at_another_school(self):
+        with self.assertRaises(services.NotPermitted):
+            services.release_student_as(self.grace_admin, self.child)
+
+        self.child.refresh_from_db()
+        self.assertEqual(self.child.status, MembershipStatus.ACTIVE)
+
+    def test_only_a_live_student_membership_can_be_released(self):
+        teacher = services.grant_membership(
+            make_user("ada", "Ada Obi"), self.stmarys, Role.TEACHER
+        )
+        with self.assertRaises(services.NotAStudent):
+            services.release_student(teacher)
+
+        services.release_student(self.child)
+        # Releasing twice is not a way to move `ended_on`.
+        with self.assertRaises(services.NotEnrolled):
+            services.release_student(self.child)
+
+    def test_a_suspended_student_can_still_be_released(self):
+        self.child.status = MembershipStatus.SUSPENDED
+        self.child.save(update_fields=["status"])
+
+        released = services.release_student_as(self.stmarys_admin, self.child)
+        self.assertEqual(released.status, MembershipStatus.ENDED)
+
+    def test_the_both_ends_path_still_works_for_platform_staff(self):
+        """`transfer_student_as()` is kept, and still carries the family across."""
+        operator = make_user("ops", "Ops Person", is_platform_staff=True)
+
+        moved = services.transfer_student_as(operator, self.child, self.grace)
+
+        self.assertEqual(moved.school, self.grace)
+        self.assertTrue(self.parent.has_access_to(self.grace))
+        self.assertFalse(self.parent.has_access_to(self.stmarys))

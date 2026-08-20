@@ -7,6 +7,8 @@ The shape to keep in mind:
     User            a person, one login, no role of its own
     Membership      (person, school, role) — the only place a role exists
     Guardianship    (parent user, a child's STUDENT membership)
+    TransferRequest one school's proposal to move a child to another, and the
+                    other school's answer — two signatures, one transfer
 
 A person is not "a teacher"; a person *is a teacher at a school*, and may
 simultaneously be a parent at that school and at two others. So role is an
@@ -16,8 +18,8 @@ attribute of the relationship, never of the user.
 from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.core.exceptions import ValidationError
-from django.db import models
-from django.db.models import Q
+from django.db import models, transaction
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .identifiers import canonical_username, normalize_email, normalize_phone, try_normalize_phone
@@ -468,3 +470,412 @@ class Guardianship(models.Model):
     @property
     def school(self):
         return self.student.school
+
+
+class TransferError(Exception):
+    """A transfer could not be requested, accepted or called off as asked.
+
+    The base for every refusal in the handshake, on both sides of the seam: the
+    states this module enforces (already resolved, the enrolment moved on) and
+    the ones `transfers.py` enforces (wrong side, nothing to answer). It lives
+    here rather than there because the dependency already runs that way —
+    `transfers.py` imports this module, not the reverse — so one
+    `except TransferError` catches the whole flow.
+
+    Deliberately not a subclass of `services.MembershipError`: that hierarchy
+    lives in `services.py`, which imports *this* module, and reaching the other
+    way for a base class would be a circular import. `NotPermitted` is still
+    raised from `services` for authority, exactly as the invitation flow does.
+    """
+
+
+class TransferAlreadyResolved(TransferError):
+    """This request has already been accepted, declined or withdrawn."""
+
+
+class EnrolmentMovedOn(TransferError):
+    """The enrolment this request would move is no longer live.
+
+    Its own type because the fix differs: nothing is wrong with the request, and
+    nobody did anything wrong. The child left by another route — released
+    without a destination, graduated, transferred by platform staff — while this
+    sat pending, so there is nothing left to hand over.
+    """
+
+
+class TransferSide(models.TextChoices):
+    """Which end of a transfer somebody is acting from.
+
+    Two schools, and every act in the handshake belongs to exactly one of them.
+    Naming the side rather than the school is what keeps the rules readable: the
+    requester signs for their own side, the answerer for the other, and neither
+    statement has to mention which school is which.
+    """
+
+    RELEASING = "releasing", "Releasing school"
+    RECEIVING = "receiving", "Receiving school"
+
+    @property
+    def other(self) -> "TransferSide":
+        return (
+            TransferSide.RECEIVING
+            if self == TransferSide.RELEASING
+            else TransferSide.RELEASING
+        )
+
+
+class TransferRoute(models.TextChoices):
+    """How a transfer came to happen — and therefore what this row is evidence of.
+
+    Set by the code path that wrote the row, never by a caller: neither
+    `request_transfer_as()` nor `transfer_student_as()` accepts it as an
+    argument, so a row cannot claim to be something it is not. The check
+    constraints below make the same guarantee at the database level, so it holds
+    against a shell session and a data migration too.
+
+    HANDSHAKE     Two schools agreed. Two distinct signatories, `requested_side`
+                  says who spoke first, and the row passed through `pending`.
+    SINGLE_PARTY  One actor held authority at both ends and did the whole thing
+                  through `services.transfer_student_as()`. There was never a
+                  second party, so the row names one person twice and has no
+                  side — and says so rather than dressing itself up as consent
+                  that nobody gave.
+    """
+
+    HANDSHAKE = "handshake", "Agreed between two schools"
+    SINGLE_PARTY = "single_party", "Carried out by one authority"
+
+
+class TransferRequestStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    ACCEPTED = "accepted", "Accepted"
+    DECLINED = "declined", "Declined"
+    WITHDRAWN = "withdrawn", "Withdrawn"
+
+
+class TransferRequestQuerySet(models.QuerySet):
+    def pending(self):
+        return self.filter(status=TransferRequestStatus.PENDING)
+
+    def for_school(self, school):
+        """Everything either side of `school` — outgoing and incoming alike."""
+        return self.filter(Q(student__school=school) | Q(to_school=school))
+
+    def awaiting(self, school):
+        """Pending requests it is `school`'s turn to answer, and can still answer.
+
+        The other side asked; this side has not replied. Note it is keyed off
+        which side *requested*, not off which school appears where: a school
+        both receives requests to admit and receives requests to release, and
+        the only thing separating them is who spoke first.
+
+        The live-enrolment filter is what keeps this list honest. A request whose
+        child left by another route stays PENDING — nobody declined it, and
+        rewriting its status to pretend otherwise would put a lie in the record
+        this table exists to be. But it can never be accepted again, so showing
+        it as work waiting on a school would be its own kind of lie. It drops
+        out of the queue and keeps its status.
+        """
+        return self.pending().filter(
+            Q(student__status__in=LIVE_STATUSES)
+            & (
+                Q(requested_side=TransferSide.RELEASING, to_school=school)
+                | Q(requested_side=TransferSide.RECEIVING, student__school=school)
+            )
+        )
+
+
+class TransferRequest(models.Model):
+    """One school's proposal to move a child to another, and the other's answer.
+
+    `release_student_as()` and `enroll_student_as()` already let two schools move
+    a child without either writing at the other, but they are two unconnected
+    acts: nothing ties a release to the admission it was meant for, nothing
+    records that anyone agreed, and between them the child belongs to no school.
+    This is what connects them.
+
+    **The handshake assembles two-sided authority out of two one-sided acts.**
+    That is the whole idea, and it is worth stating plainly. `transfer_student()`
+    genuinely needs authority at both ends — it ends a membership at one school
+    and opens one at the other. Requiring one caller to hold both is what made
+    ordinary transfers impossible. So one school signs by *requesting*, the other
+    signs by *accepting*, and only when both signatures exist does the transfer
+    run — in a single transaction, which is what closes the window the two-act
+    path leaves open. Neither side ever acted at the other's school; the pair of
+    consents did.
+
+    Either side may initiate. A releasing school saying "we are letting this
+    child go to Grace Academy" and a receiving school saying "we would like to
+    admit this child from St Mary's" are the same proposal from opposite ends,
+    and which one happens first is a fact about the family, not about the model.
+    `requested_side` records which it was, because "who asked" is the first
+    question anyone will have when a transfer is disputed.
+
+    Points at the child's STUDENT `Membership` rather than repeating the child
+    and the school they are leaving. That one foreign key pins both, and it
+    cannot drift out of step with the enrolment it is proposing to move — which
+    two loose columns could. `student_user` and `from_school` read them back off
+    it.
+    """
+
+    student = models.ForeignKey(
+        Membership,
+        related_name="transfer_requests",
+        on_delete=models.PROTECT,
+        help_text="The child's STUDENT membership, which pins the leaving school too.",
+    )
+    to_school = models.ForeignKey(
+        "schools.School", related_name="incoming_transfer_requests", on_delete=models.PROTECT
+    )
+
+    requested_by = models.ForeignKey(
+        User, related_name="transfer_requests_made", on_delete=models.PROTECT
+    )
+    #: Which end asked. Not derivable after the fact: an admin can hold
+    #: authority at both schools, and by the time anyone reads this row the
+    #: memberships that granted it may have changed.
+    #:
+    #: Null on a SINGLE_PARTY row, and null rather than a default, because there
+    #: was no side: one actor held both ends. Writing RELEASING there to avoid a
+    #: nullable column would be inventing a fact, and this table's whole purpose
+    #: is to be believed. A constraint below ties the two fields together.
+    requested_side = models.CharField(
+        max_length=16, choices=TransferSide, null=True, blank=True
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+
+    #: Whether two schools agreed or one authority acted alone. See TransferRoute.
+    route = models.CharField(
+        max_length=16, choices=TransferRoute, default=TransferRoute.HANDSHAKE
+    )
+
+    #: Who took this out of `pending`, and when. Null while it is still open.
+    #:
+    #: "Resolved", not "answered", and the difference is load-bearing. An accept
+    #: or a decline is an *answer*, and comes from the other side of the table by
+    #: definition. A withdrawal comes from the side that asked, and may well be
+    #: the same person who asked — so a column called `answered_by` invited the
+    #: rule "these two names always differ", which is false for exactly that
+    #: case. The constraint below states the narrower thing that is actually
+    #: true: an *answered* transfer names two people.
+    resolved_by = models.ForeignKey(
+        User,
+        related_name="transfer_requests_answered",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    status = models.CharField(
+        max_length=16, choices=TransferRequestStatus, default=TransferRequestStatus.PENDING
+    )
+    #: What the receiving school will call the child. Carried on the request so
+    #: it can be offered when the receiving school initiates, and supplied at
+    #: acceptance otherwise; either way it is the receiving school's to set.
+    reference = models.CharField(max_length=64, blank=True)
+    note = models.TextField(blank=True, help_text="Free text, shown to both schools.")
+
+    objects = TransferRequestQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-requested_at"]
+        constraints = [
+            # At most one pending request per enrolment, in the database rather
+            # than in application code — the same spirit as the one-school slot
+            # it protects. Two pending requests would let one school agree to
+            # Grace and another admin agree to Hillside for the same child, and
+            # whichever landed second would find the enrolment already gone.
+            # A second destination has to wait for the first to be declined or
+            # withdrawn, which is a real constraint on schools and the honest
+            # one: a child is transferring to one place.
+            models.UniqueConstraint(
+                fields=["student"],
+                condition=Q(status="pending"),
+                name="one_pending_transfer_request_per_student",
+            ),
+            # The next four are what stop a row lying about how it came about.
+            # Application code already writes `route` itself rather than taking
+            # it from a caller, but "the only code that writes this is careful"
+            # is a property of today's code; these are properties of the table.
+            #
+            # An answered handshake names two different people. This is
+            # `SameSignatory` again, one layer down — and the layer that also
+            # catches a shell session, a data migration, or a future endpoint
+            # that forgets.
+            #
+            # Scoped to accepted and declined, which are the outcomes that claim
+            # something about the *other* school. A withdrawal is the asking
+            # side retracting its own proposal, so it names its own people and
+            # frequently the very person who asked; demanding two names there
+            # would forbid the most ordinary thing a school can do with a
+            # request it no longer wants.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.SINGLE_PARTY)
+                | Q(
+                    status__in=[
+                        TransferRequestStatus.PENDING,
+                        TransferRequestStatus.WITHDRAWN,
+                    ]
+                )
+                | (
+                    Q(resolved_by__isnull=False)
+                    & ~Q(requested_by=F("resolved_by"))
+                ),
+                name="answered_transfer_names_two_signatories",
+            ),
+            # A single-party row names one person, twice, and never nobody: it
+            # is written only after the transfer has happened, so an unanswered
+            # one would describe an event with no author.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.HANDSHAKE)
+                | (Q(resolved_by__isnull=False) & Q(requested_by=F("resolved_by"))),
+                name="single_party_transfer_names_one_signatory",
+            ),
+            # ...and only after it succeeded, so it is never pending, declined
+            # or withdrawn. There was no proposal to answer.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.HANDSHAKE)
+                | Q(status=TransferRequestStatus.ACCEPTED),
+                name="single_party_transfer_is_always_accepted",
+            ),
+            # A side is exactly the thing a single-party transfer does not have,
+            # and exactly the thing a handshake must record.
+            models.CheckConstraint(
+                condition=Q(route=TransferRoute.HANDSHAKE, requested_side__isnull=False)
+                | Q(route=TransferRoute.SINGLE_PARTY, requested_side__isnull=True),
+                name="transfer_side_matches_route",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["to_school", "status"]),
+            models.Index(fields=["student", "status"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.get_status_display()} transfer of {self.student.name} "
+            f"to {self.to_school}"
+        )
+
+    # -- read the pair back off the membership --------------------------------
+
+    @property
+    def student_user(self):
+        return self.student.user
+
+    @property
+    def from_school(self):
+        return self.student.school
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == TransferRequestStatus.PENDING
+
+    def school_for(self, side):
+        """The school somebody acting for `side` must hold authority at.
+
+        Asked as a question about a side rather than about a user, because a
+        person may hold authority at both ends and the model should not have to
+        care which. `school_for(requested_side.other)` is therefore "who still
+        has to sign this".
+        """
+        return self.from_school if side == TransferSide.RELEASING else self.to_school
+
+    # -- answering ------------------------------------------------------------
+
+    def _lock_pending(self):
+        """This row, locked, if it is still open to an answer.
+
+        Every answer starts here, so "is this still pending?" is asked once, of
+        a row this transaction holds, rather than of whatever the caller happened
+        to load. The invitation flow learned that the expensive way: a guard
+        reading an in-memory copy is answering a question about the past, and two
+        answers arriving together both passed it before either wrote.
+
+        `.order_by()` for the reason `Meta.ordering` always needs it under
+        `FOR UPDATE` — this one sorts by a local column, but the habit is what
+        keeps the next person from adding a joined sort and locking two more
+        tables without noticing.
+        """
+        locked = (
+            TransferRequest.objects.select_for_update().order_by().get(pk=self.pk)
+        )
+        if locked.status != TransferRequestStatus.PENDING:
+            # Bring the caller's object in line with what the lock read, so it
+            # stops asserting the state this transaction has just disproved.
+            self.status = locked.status
+            self.resolved_by_id = locked.resolved_by_id
+            self.resolved_at = locked.resolved_at
+            raise TransferAlreadyResolved(
+                f"This transfer request was already "
+                f"{locked.get_status_display().lower()}."
+            )
+        return locked
+
+    def _record_answer(self, by, status, *, extra_fields=()):
+        self.status = status
+        self.resolved_by = by
+        self.resolved_at = timezone.now()
+        self.save(
+            update_fields=["status", "resolved_by", "resolved_at", *extra_fields]
+        )
+        return self
+
+    @transaction.atomic
+    def accept(self, by, *, reference=""):
+        """Both signatures are now in. Runs the transfer, returns the new membership.
+
+        The transfer itself is `services.transfer_student()`, unchanged, and
+        called here for the first time by something other than an admin who
+        holds both schools. That is the point: the two consents recorded on this
+        row *are* the two-sided authority it has always needed, so it can run in
+        one transaction — no window where the child belongs to nowhere, and the
+        guardians carried across rather than re-linked by hand.
+
+        The enrolment is re-checked rather than assumed. A pending request is a
+        proposal about a relationship, and the relationship may have moved on
+        while the request sat there — the child released without a destination,
+        graduated, or moved by platform staff. Accepting then would either fail
+        on the one-live-student index or quietly revive an ended enrolment, so
+        `EnrolmentMovedOn` says what actually happened instead.
+
+        The answer is written **last**, after everything that could refuse has
+        refused. A row reading "accepted" beside an enrolment that never moved
+        would be a worse record than no row at all, and this is a record whose
+        whole purpose is to be trusted when a transfer is disputed.
+        """
+        # Imported here, not at module scope: `services` imports this module, so
+        # a module-level import would close the loop.
+        from .services import transfer_student
+
+        self._lock_pending()
+
+        student = (
+            Membership.objects.select_for_update().order_by().get(pk=self.student_id)
+        )
+        if not student.is_live:
+            raise EnrolmentMovedOn(
+                f"{student.user}'s enrolment at {student.school} is "
+                f"{student.get_status_display().lower()}, so there is nothing to "
+                f"hand over. A fresh admission is the way in now."
+            )
+
+        if reference:
+            self.reference = reference
+
+        moved = transfer_student(student, self.to_school, reference=self.reference)
+        self._record_answer(by, TransferRequestStatus.ACCEPTED, extra_fields=["reference"])
+        return moved
+
+    @transaction.atomic
+    def decline(self, by):
+        """The other side says no. The enrolment is untouched."""
+        self._lock_pending()
+        return self._record_answer(by, TransferRequestStatus.DECLINED)
+
+    @transaction.atomic
+    def withdraw(self, by):
+        """The side that asked calls it off. The enrolment is untouched."""
+        self._lock_pending()
+        return self._record_answer(by, TransferRequestStatus.WITHDRAWN)
