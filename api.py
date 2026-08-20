@@ -1,6 +1,7 @@
-"""HTTP surface for the staff invitation flow.
+"""The HTTP surface: staff invitations here, the gradebook in its own module.
 
-Five endpoints, in two halves that differ in who is on the other end.
+The invitation endpoints are five, in two halves that differ in who is on the
+other end.
 
 The three `/api/schools/{slug}/...` routes are administrative and authenticated:
 a signed-in person acting at a school they hold authority at. Authority is not
@@ -15,6 +16,15 @@ Both are therefore unauthenticated, both look their invitation up through
 `Invitation.validate_token()`, and both answer a bad token with a flat 404 —
 never "expired" versus "revoked" versus "no such thing", which would tell
 somebody testing guessed tokens which of them were real.
+
+`/api/gradebook/...` is mounted from `gradebook/api.py` rather than written out
+below, and the split is the tenancy line rather than file length. Everything in
+this file writes **shared** tables, which is why those paths name their school
+in a `{slug}`: the school is a row and has to be identified. The gradebook is a
+tenant app whose tables live in the school's own schema, already chosen from the
+hostname by `TenantMainMiddleware` — so its paths carry no slug, and keeping the
+two conventions in one file would invite a route that mixes them. That module's
+docstring has the argument in full.
 """
 
 from typing import Optional
@@ -26,6 +36,7 @@ from ninja.errors import HttpError
 from ninja.security import django_auth
 
 from accounts.services import NotPermitted
+from gradebook.api import router as gradebook_router
 from schools import invitations as invitation_service
 from schools.delivery import NoDeliveryAddress
 from schools.models import (
@@ -38,6 +49,8 @@ from schools.models import (
 )
 
 api = NinjaAPI(title="Luffy School API", version="1.0.0")
+
+api.add_router("/gradebook/", gradebook_router, tags=["gradebook"])
 
 
 # -- request and response shapes ---------------------------------------------
