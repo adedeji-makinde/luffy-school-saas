@@ -365,7 +365,9 @@ def _deliver(invitation, raw_token, accept_url_for):
 
     What remains post-commit is genuine infrastructure failure (an SMTP outage),
     where the row surviving is the right outcome: the invitation exists and can
-    be resent once the channel is healthy.
+    be resent once the channel is healthy. `send()` raises `DeliveryFailed` for
+    that case so the admin is told, rather than letting an `SMTPException` reach
+    them as an unexplained 500.
 
     `accept_url_for` is an override, not a requirement. It used to be neither:
     passing nothing returned early — minting a live token, skipping
@@ -377,15 +379,22 @@ def _deliver(invitation, raw_token, accept_url_for):
     """
     channel = get_channel()
 
-    # Configuration before people, when both are wrong. "This platform has no
-    # accept URL" is the more useful answer than "that teacher has no email
-    # address": the first is true for everybody and blocks the admin's next
-    # attempt too, while the second is one row they can fix by typing.
+    # Both optional halves of the seam — a test double, or any channel that
+    # cannot answer without sending, simply does not define them. Configuration
+    # first: "this deploy has no mail host" is a better answer than "that
+    # teacher has no email address" when both are true. See delivery.Channel.
+    check_configured = getattr(channel, "check_configured", None)
+    if check_configured is not None:
+        check_configured()
+
+    # ...and the accept URL, which is configuration too. Both before people:
+    # "this platform has no mail host / no accept URL" is the more useful answer
+    # than "that teacher has no email address", because the first is true for
+    # everybody and blocks the admin's next attempt too, while the second is one
+    # row they can fix by typing.
     build_url = accept_url_for or configured_accept_url
     accept_url = build_url(raw_token)
 
-    # Optional half of the seam — a test double, or any channel that cannot
-    # answer without sending, simply does not define it. See delivery.Channel.
     check_deliverable = getattr(channel, "check_deliverable", None)
     if check_deliverable is not None:
         check_deliverable(invitation)

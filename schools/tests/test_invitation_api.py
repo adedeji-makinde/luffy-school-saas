@@ -14,8 +14,10 @@ even have a password yet — for them the token is the credential.
 """
 
 from datetime import timedelta
+from unittest import mock
 
-from django.test import TestCase, override_settings
+from django.core import mail
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from accounts.deletion import deactivate_user
@@ -765,3 +767,131 @@ class AcceptLinkOriginTests(TestCase):
         self.assertEqual(Invitation.objects.count(), 0)
         self.assertFalse(User.objects.filter(email="nobody@example.com").exists())
         self.assertEqual(RecordingChannel.sent, [])
+
+
+@override_settings(
+    INVITATION_CHANNEL="schools.delivery.EmailChannel",
+    INVITATION_ACCEPT_URL=ACCEPT_URL,
+)
+class MailFailureApiTests(TransactionTestCase):
+    """Finding #7, over HTTP: what the admin is told when mail is broken.
+
+    The two halves are deliberately different answers. A deploy with no
+    `EMAIL_HOST` is refused with nothing committed — nobody can be invited until
+    an operator fixes it. An outage *after* the commit cannot be undone and
+    should not be: the invitation exists and is resendable, so the admin is told
+    that rather than being handed a 500 and left guessing whether it worked.
+
+    `TransactionTestCase`, and that is the whole point rather than a preference.
+    The 502 depends on *where* an `on_commit` callback runs: `invite_staff()` is
+    the outermost atomic block, so its callbacks fire as that block commits —
+    inside the service call, inside the view's `try`, which is what lets `api.py`
+    catch `DeliveryFailed` and answer 502. Under `TestCase` the whole test is
+    wrapped in a transaction that never commits, so
+    `captureOnCommitCallbacks(execute=True)` runs the callbacks *after* the view
+    has already returned. Written that way this test passed a 201 and let the
+    exception escape into the test itself — proving nothing about the handler it
+    exists to cover.
+    """
+
+    def setUp(self):
+        portal = School(name="Portal", slug="portal", schema_name="public")
+        portal.auto_create_schema = False
+        portal.save()
+        Domain.objects.create(tenant=portal, domain="testserver", is_primary=True)
+
+        self.stmarys = make_school("St Mary's", "st-marys", "st_marys")
+        self.admin = User.objects.create_user(
+            "admin@st-marys.school",
+            PASSWORD,
+            full_name="Ada Admin",
+            email="admin@st-marys.school",
+        )
+        grant_membership(self.admin, self.stmarys, Role.ADMIN)
+        self.client.force_login(self.admin)
+
+    def post_invite(self, email="new.teacher@example.com"):
+        # No `captureOnCommitCallbacks` here, deliberately. These commit for
+        # real, so delivery is dispatched where it is dispatched in production:
+        # as `invite_staff()`'s atomic block exits, inside the view.
+        return self.client.post(
+            "/api/schools/st-marys/invitations/",
+            data={"role": Role.TEACHER.value, "email": email},
+            content_type="application/json",
+        )
+
+    @override_settings(
+        EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend", EMAIL_HOST=""
+    )
+    def test_no_mail_host_is_a_503_and_creates_nothing(self):
+        response = self.post_invite()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("EMAIL_HOST", response.json()["detail"])
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertEqual(Membership.objects.filter(role=Role.TEACHER).count(), 0)
+        self.assertFalse(User.objects.filter(email="new.teacher@example.com").exists())
+
+    def test_a_mail_outage_is_a_502_and_the_invitation_survives_to_be_resent(self):
+        """Committed and undeliverable is a real state, and it has an answer.
+
+        `_deliver()` dispatches through `on_commit`, so this failure arrives
+        after the rows are durable. Losing them is not an option and pretending
+        the mail went out is worse, so the admin gets a distinct code and an
+        invitation they can resend.
+        """
+        with mock.patch(
+            "schools.delivery.send_mail",
+            side_effect=ConnectionRefusedError("[Errno 111] Connection refused"),
+        ):
+            response = self.post_invite()
+
+        self.assertEqual(response.status_code, 502)
+        detail = response.json()["detail"]
+        self.assertIn("Resend", detail)
+        # The cause is logged, not handed to the caller. `SMTPAuthenticationError`
+        # carries the mail server's own response — a hostname and a credential
+        # complaint that a school admin has no business reading.
+        self.assertNotIn("Errno", detail)
+        self.assertNotIn("Connection refused", detail)
+
+        invitation = Invitation.objects.get()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+        self.assertEqual(invitation.membership.status, MembershipStatus.INVITED)
+
+        # And the resend works once mail does, rather than the row being stuck.
+        mail.outbox = []
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"
+        ):
+            resent = self.client.post(
+                f"/api/schools/st-marys/invitations/{invitation.pk}/resend/"
+            )
+
+        self.assertEqual(resent.status_code, 201)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("portal.example.school", mail.outbox[0].body)
+
+    def test_retrying_a_failed_invite_does_not_pile_up_placeholder_accounts(self):
+        """Why losing the row post-commit is not the emergency it looks like.
+
+        Re-inviting the same person is idempotent: the account is reused, the
+        membership is already INVITED, and `_issue()` revokes the stale token
+        before minting the next. So an admin hammering the button through an
+        outage leaves one account and one live invitation, not one per attempt.
+        """
+        with mock.patch(
+            "schools.delivery.send_mail",
+            side_effect=ConnectionRefusedError("[Errno 111] Connection refused"),
+        ):
+            for _ in range(3):
+                self.assertEqual(self.post_invite().status_code, 502)
+
+        self.assertEqual(User.objects.filter(email="new.teacher@example.com").count(), 1)
+        self.assertEqual(
+            Membership.objects.filter(
+                user__email="new.teacher@example.com", school=self.stmarys
+            ).count(),
+            1,
+        )
+        self.assertEqual(Invitation.objects.filter(status=InvitationStatus.PENDING).count(), 1)

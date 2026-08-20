@@ -127,6 +127,28 @@ DEFAULT_EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", DEFAULT_EMAIL_BACKEND)
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@luffy.school")
 
+#: Where that SMTP backend connects. Django's own defaults are `localhost:25`
+#: with no credentials, which is not a mail server anywhere this runs — so the
+#: deploy that sets `EMAIL_BACKEND` nowhere (the intended path, since SMTP is the
+#: default above) got `ConnectionRefusedError` on every single invitation.
+#:
+#: Which host and which credentials is a deployment decision and stays one:
+#: these are read from the environment and have no in-repo values. What is *not*
+#: left to the deploy is what happens when they are missing — `EmailChannel`
+#: refuses to accept an invitation it has nowhere to send, before the
+#: transaction commits, rather than raising from inside an `on_commit` callback
+#: where nothing can be undone. See `delivery.EmailChannel.check_configured()`.
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "1") == "1"
+EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "0") == "1"
+#: Bounded on purpose. `send()` runs in the request/response cycle via
+#: `on_commit`, so an unreachable mail host with no timeout holds the worker for
+#: as long as the OS lets the connection hang.
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
+
 DATABASES = {
     "default": {
         "ENGINE": "django_tenants.postgresql_backend",

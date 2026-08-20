@@ -12,7 +12,10 @@ and none is done; `make_school()` here skips `CREATE SCHEMA` for the same reason
 `accounts/tests/test_membership.py` does.
 """
 
+import os
 from datetime import datetime, timedelta, timezone as std_timezone
+from pathlib import Path
+from unittest import mock
 
 from django.conf import settings
 from django.core import mail
@@ -23,7 +26,12 @@ from accounts.deletion import deactivate_user, reactivate_user
 from accounts.models import Membership, MembershipStatus, Role, User
 from accounts.services import NotPermitted, grant_membership
 from schools import invitations as invitation_service
-from schools.delivery import DeliveryNotConfigured, EmailChannel, NoDeliveryAddress
+from schools.delivery import (
+    DeliveryFailed,
+    DeliveryNotConfigured,
+    EmailChannel,
+    NoDeliveryAddress,
+)
 from schools.models import (
     Invitation,
     InvitationError,
@@ -772,6 +780,20 @@ class DeliveryTests(InvitationSetUp):
         self.assertEqual(RecordingChannel.sent[-1]["raw_token"], raw_token)
         self.assertEqual(Invitation.validate_token(raw_token), invitation)
 
+    def test_a_channel_that_cannot_report_its_configuration_still_works(self):
+        """`check_configured()` is optional for the same reason.
+
+        The seam gained a second optional hook, and a double that predates it
+        must keep working — otherwise "an object with a `send()`" quietly became
+        "an object with a `send()` and two checks".
+        """
+        self.assertFalse(hasattr(RecordingChannel, "check_configured"))
+        with recording():
+            with self.captureOnCommitCallbacks(execute=True):
+                _invitation, raw_token = self.invite()
+
+        self.assertEqual(RecordingChannel.sent[-1]["raw_token"], raw_token)
+
 
 class AcceptUrlTests(InvitationSetUp):
     """Where the link in the mail points, and who decides.
@@ -902,6 +924,141 @@ class AcceptUrlTests(InvitationSetUp):
             RecordingChannel.sent[-1]["accept_url"],
             f"https://portal.example.school/invitations/{resent_token}/",
         )
+
+
+class MailConfigurationTests(InvitationSetUp):
+    """Finding #7: an SMTP default with nowhere to connect.
+
+    `settings.EMAIL_BACKEND` defaults to SMTP on purpose, so that a deploy which
+    configures nothing fails closed rather than printing live tokens to the
+    application log. But Django's own SMTP defaults are `localhost:25`, which is
+    not a mail server on any host this runs on — so "fails closed" arrived as a
+    `ConnectionRefusedError` raised from inside an `on_commit` callback, after
+    everything had committed, and reached the admin as an unexplained 500.
+    """
+
+    def counts(self):
+        return (
+            Invitation.objects.count(),
+            User.objects.count(),
+            Membership.objects.count(),
+        )
+
+    def test_smtp_with_no_host_is_refused_before_anything_commits(self):
+        before = self.counts()
+        with override_settings(
+            INVITATION_CHANNEL="schools.delivery.EmailChannel",
+            EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend",
+            EMAIL_HOST="",
+        ):
+            with self.assertRaises(DeliveryNotConfigured):
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.invite()
+
+        self.assertEqual(
+            self.counts(), before, "a misconfigured deploy must leave nothing behind"
+        )
+
+    def test_the_email_host_default_is_empty_not_localhost(self):
+        """What `check_configured()` quietly depends on, stated out loud.
+
+        Django's own `EMAIL_HOST` default is `"localhost"` — truthy, and
+        therefore invisible to a "is this configured?" check. The guard works
+        only because `settings.py` defaults it to `""` instead. Delete that one
+        line and the guard stops guarding while every other test still passes,
+        so the coupling is asserted here rather than left to be rediscovered.
+        """
+        self.assertEqual(
+            settings.EMAIL_HOST,
+            os.environ.get("EMAIL_HOST", ""),
+            "EMAIL_HOST must come from the environment, defaulting to empty",
+        )
+        # And the guard has to be able to see "unset". Read the module's source
+        # default rather than the live value, which an environment that *does*
+        # set EMAIL_HOST would otherwise mask.
+        source = (Path(settings.BASE_DIR) / "settings.py").read_text()
+        self.assertIn('EMAIL_HOST = os.environ.get("EMAIL_HOST", "")', source)
+
+    def test_a_configured_smtp_host_passes_the_check(self):
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend",
+            EMAIL_HOST="smtp.example.school",
+        ):
+            self.assertIsNone(EmailChannel().check_configured())
+
+    def test_backends_that_need_no_host_are_not_asked_for_one(self):
+        """The check is scoped to backends that actually dial out.
+
+        Applying it to "anything that is not locmem" would refuse every
+        development deploy on the console backend, and the test runner's own
+        locmem substitution besides.
+        """
+        for backend in (
+            "django.core.mail.backends.console.EmailBackend",
+            "django.core.mail.backends.locmem.EmailBackend",
+            "django.core.mail.backends.filebased.EmailBackend",
+        ):
+            with self.subTest(backend=backend):
+                with override_settings(EMAIL_BACKEND=backend, EMAIL_HOST=""):
+                    self.assertIsNone(EmailChannel().check_configured())
+
+    def test_a_mail_outage_becomes_DeliveryFailed_and_the_invitation_survives(self):
+        """The post-commit half, which is genuinely too late to undo.
+
+        A refused connection after commit is not a reason to lose the
+        invitation: the row is resendable once mail is healthy. It *is* a reason
+        to tell the admin something other than an unexplained 500, which is what
+        the type is for.
+        """
+        with recording():
+            invitation, _raw = self.invite()
+
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"
+        ):
+            with mock.patch(
+                "schools.delivery.send_mail",
+                side_effect=ConnectionRefusedError("[Errno 111] Connection refused"),
+            ):
+                with self.assertRaises(DeliveryFailed):
+                    EmailChannel().send(
+                        invitation, "a-token", accept_url="https://portal/i/a-token/"
+                    )
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+
+    def test_a_bug_in_the_channel_is_not_reported_as_a_mail_outage(self):
+        """The `except` is narrow so that it cannot swallow unrelated failures.
+
+        `except Exception` around the send would fold a `TypeError` in the body
+        template into "the mail server is down" — a bug report nobody would then
+        ever receive, and an admin retrying an outage that does not exist.
+        """
+        with recording():
+            invitation, _raw = self.invite()
+
+        with mock.patch(
+            "schools.delivery.send_mail",
+            side_effect=TypeError("body template took the wrong argument"),
+        ):
+            with self.assertRaises(TypeError):
+                EmailChannel().send(
+                    invitation, "a-token", accept_url="https://portal/i/a-token/"
+                )
+
+    def test_send_re_checks_its_configuration_rather_than_trusting_the_caller(self):
+        """`send()` is reachable on its own, exactly as `check_deliverable()` is."""
+        with recording():
+            invitation, _raw = self.invite()
+
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend", EMAIL_HOST=""
+        ):
+            with self.assertRaises(DeliveryNotConfigured):
+                EmailChannel().send(
+                    invitation, "a-token", accept_url="https://portal/i/a-token/"
+                )
 
 
 class InviteeResolutionTests(InvitationSetUp):

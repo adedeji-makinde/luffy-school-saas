@@ -27,7 +27,7 @@ from ninja.security import django_auth
 
 from accounts.services import NotPermitted
 from schools import invitations as invitation_service
-from schools.delivery import DeliveryNotConfigured, NoDeliveryAddress
+from schools.delivery import DeliveryFailed, DeliveryNotConfigured, NoDeliveryAddress
 from schools.models import (
     Invitation,
     InvitationError,
@@ -165,6 +165,14 @@ def create_invitation(request, slug: str, payload: InviteIn):
         # so no invitation can be issued by anyone until an operator sets one.
         # Raised before the transaction committed, so nothing was left behind.
         raise HttpError(503, str(exc))
+    except DeliveryFailed as exc:
+        # 502, and the invitation *exists*. `_deliver()` dispatches through
+        # `on_commit`, and `invite_staff()` is the outermost atomic block, so
+        # this arrives here after the commit — too late to undo, which is the
+        # right outcome anyway: the row can be resent once mail is healthy, and
+        # re-inviting is idempotent because `_issue()` revokes the stale token.
+        # Told apart from a 500 so the admin knows which of those happened.
+        raise HttpError(502, str(exc))
     return 201, InvitationOut.of(invitation)
 
 
@@ -203,6 +211,8 @@ def resend_invitation(request, slug: str, invitation_id: int):
         raise HttpError(400, str(exc))
     except DeliveryNotConfigured as exc:
         raise HttpError(503, str(exc))
+    except DeliveryFailed as exc:
+        raise HttpError(502, str(exc))
     except InvitationError as exc:
         # AlreadyAccepted and MembershipNotOpen both land here, and so does
         # anything else the flow refuses on state grounds — which is what this
