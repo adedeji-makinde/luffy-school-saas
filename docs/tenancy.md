@@ -36,6 +36,13 @@ alone, so each one really does run `CREATE SCHEMA` followed by the full
 `migrate_schemas` pass for `TENANT_APPS`. The assertions read `pg_namespace`,
 `pg_tables`, `pg_indexes` and `pg_constraint` rather than taking Django's word.
 
+`academics/tests/test_term.py` — 16 tests over the `Term` record itself, each
+running inside a real school schema for the same reason. They cover the four
+dates and the day count, the constraints that bound them, and two Django-level
+traps that only show up against Postgres — see the notes below on date
+subtraction and on `Func` in migrations. Still **no foreign keys**: the blocker
+at the bottom of this document stands, and `Term` genuinely does not need one.
+
 `schools/tests/test_cross_schema_fk.py` — 6 tests, holding the evidence for the
 blocker at the bottom of this document. Real Django models with real foreign
 keys into `public`, real `.delete()` calls, across two real schemas.
@@ -83,6 +90,47 @@ The rest of what passed:
   two schools resolves from inside either one, including `has_access_to()` for
   the *other* school.
 - Dropping one school takes only its own schema and leaves the other intact.
+
+## The `Term` record
+
+The one tenant-scoped model there is, and the shape every later school-owned
+record will hang off. Six fields worth naming:
+
+| Field | | |
+| --- | --- | --- |
+| `session` | `2025/2026` | the academic year, as a formatted string |
+| `name` | first / second / third | with `(session, name)` unique per schema |
+| `starts_on`, `ends_on` | | `ends_on > starts_on`, enforced |
+| `next_term_starts_on` | nullable | what this term *announces* about the next |
+| `school_days` | nullable | days actually taught, as the school counts them |
+| `is_current` | | at most one per schema |
+
+Two of those are worth explaining, because both look like they should be derived
+and neither can be.
+
+**`next_term_starts_on` is a statement, not a pointer.** A school prints "Next
+term begins: 8 January" on the report card it hands out in December — at which
+point next term's `Term` row usually does not exist, so a lookup would return
+nothing at precisely the moment the date is wanted. It could not be derived
+reliably even later: the term after 2025/2026 Third is 2026/2027 *First*, so
+"the next term" crosses sessions, and `session` is a formatted string with no
+ordering of its own. A `CheckConstraint` requires it to fall strictly after
+`ends_on` when it is set — a day cannot belong to two terms.
+
+**`school_days` is the school's count, not a calculation.** Weekends come out,
+but so do mid-term break, public holidays that move year to year, sports day and
+any day the school closed for weather. This number is the denominator of the
+attendance figure on a report card, so a computed one that disagreed with the
+school's own register would make every percentage wrong in a way nobody could
+explain. It is bounded by the term it describes — at least 1, and no more than
+`(ends_on - starts_on) + 1` — which is the constraint that turned up both
+Postgres traps documented below. `Term.calendar_days` exposes that ceiling and
+is deliberately *not* a default for `school_days`: they answer different
+questions.
+
+Both are nullable, because "not announced yet" and "not counted yet" are the
+honest state for most of a term, and inventing a denominator to get a row saved
+is worse than leaving it absent.
 
 ## What this does **not** prove
 
@@ -154,6 +202,33 @@ the test dies somewhere confusing.
 has a `condition`, so Django implements it as a unique *index*. It shows up in
 `pg_indexes` and never in `pg_constraint`. It is enforced identically; it just
 is not where you would first look for it.
+
+**Subtracting two `DateField`s gives you an interval, not a number of days.**
+`F("ends_on") - F("starts_on")` renders as `interval '1 day' * (...)`, and
+`ExpressionWrapper(..., output_field=IntegerField())` does **not** change that —
+it looks like it settles the question and does not. Postgres then refuses the
+surrounding arithmetic outright:
+
+```
+psycopg2.errors.UndefinedFunction: operator does not exist: interval + integer
+```
+
+Note when that lands: at `CREATE SCHEMA` time, not at the offending insert. A
+check constraint written that way takes down the creation of every new school,
+so it fails loudly — but nowhere near where it was written.
+`academics.models.DaysBetween` spells the subtraction out with an explicit
+template so the result is the `int4` Postgres actually returns.
+
+**A `Func` built with `template=` / `arg_joiner=` will not survive a migration
+round-trip.** Both arrive as `**extra`, and that dict's *key order* is part of
+the expression's identity — so the instance in `models.py` and the identical
+instance reconstructed from the migration compare unequal, and `makemigrations`
+proposes dropping and recreating the constraint on every run. CI runs
+`makemigrations --check`, so the symptom is a permanently red build with a
+migration that never settles. Carry them as **class attributes** on a `Func`
+subclass instead, where they never enter `extra`. `DaysBetween` does, and
+`academics/tests/test_term.py` pins the round-trip so a "simplification" back to
+an inline `Func(...)` fails in a test rather than in CI.
 
 **`django.contrib.contenttypes` is in both lists.** It is in `SHARED_APPS` and
 `TENANT_APPS`, so every school schema gets its own `django_content_type` table.
