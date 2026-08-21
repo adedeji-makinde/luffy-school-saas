@@ -74,6 +74,34 @@ class TooManyAttempts(SignInError):
         self.retry_after = retry_after
 
 
+def wait_before_retrying(identifier: str, address: str):
+    """Seconds this attempt must wait, or None if it may go ahead.
+
+    The longer of the two windows, so a client that waits exactly as long as it
+    was told is not refused a second time by the other limit.
+    """
+    open_windows = [
+        wait
+        for wait in (
+            throttling.blocked_for(SignInScope.IDENTIFIER, identifier),
+            throttling.blocked_for(SignInScope.ADDRESS, address),
+        )
+        if wait is not None
+    ]
+    return max(open_windows) if open_windows else None
+
+
+def note_failure(identifier: str, address: str) -> None:
+    """Count one wrong answer against both keys."""
+    throttling.record_failure(SignInScope.IDENTIFIER, identifier)
+    throttling.record_failure(SignInScope.ADDRESS, address)
+
+
+def note_success(identifier: str) -> None:
+    """Forgive the identifier's failures, and deliberately not the address's."""
+    throttling.clear(SignInScope.IDENTIFIER, identifier)
+
+
 def sign_in(request, identifier: str, password: str):
     """Authenticate and open a session, or raise a `SignInError`.
 
@@ -94,22 +122,15 @@ def sign_in(request, identifier: str, password: str):
     person ends up holding — and rotates the CSRF token with it.
     """
     address = throttling.client_address(request)
-    waits = [
-        throttling.blocked_for(SignInScope.IDENTIFIER, identifier),
-        throttling.blocked_for(SignInScope.ADDRESS, address),
-    ]
-    open_windows = [wait for wait in waits if wait is not None]
-    if open_windows:
-        # The longer of the two, so a client that waits exactly as long as it
-        # was told is not refused a second time by the other limit.
-        raise TooManyAttempts(max(open_windows))
+    wait = wait_before_retrying(identifier, address)
+    if wait is not None:
+        raise TooManyAttempts(wait)
 
     user = authenticate(request, username=identifier, password=password)
     if user is None:
-        throttling.record_failure(SignInScope.IDENTIFIER, identifier)
-        throttling.record_failure(SignInScope.ADDRESS, address)
+        note_failure(identifier, address)
         raise BadCredentials(REFUSED)
 
-    throttling.clear(SignInScope.IDENTIFIER, identifier)
+    note_success(identifier)
     start_session(request, user)
     return user

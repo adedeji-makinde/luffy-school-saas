@@ -28,8 +28,10 @@ stamped at all is `accounts.checks.session_cookie_spans_every_host()`.
 from datetime import timedelta
 
 from django.db import IntegrityError, connection, transaction
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 from django.utils import timezone
+
+from api import CSRF_FAILED
 
 from accounts import throttling
 from accounts.models import Role, SignInAttempts, SignInScope, User
@@ -179,6 +181,59 @@ class SigningInTests(SignInSetUp):
         )
 
         self.assertEqual(response.status_code, 403)
+
+
+class LoginIsCsrfCheckedTests(SignInSetUp):
+    """Login CSRF, which runs the opposite way round to the usual attack.
+
+    The attacker does not steal a session — they give the victim one of theirs.
+    A teacher whose browser is quietly signed in as somebody else then marks a
+    class of thirty into an account the attacker reads at leisure. `SameSite`
+    does not help: the forged request needs no cookie of ours to succeed, it
+    *sets* one.
+
+    ninja exempts its own views from Django's CSRF middleware and does the check
+    inside cookie auth instead — which the one route you use *before* you have a
+    cookie does not have. So `/api/login/` checks by hand, and `/api/csrf/`
+    exists to make that possible for a client with no template to get a token
+    from.
+
+    `enforce_csrf_checks=True` because the default test client sets
+    `_dont_enforce_csrf_checks`, under which none of this would be exercised —
+    which is exactly why the gap survived being written in the first place.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client = Client(enforce_csrf_checks=True)
+
+    def test_a_sign_in_with_no_token_is_refused(self):
+        response = self.sign_in()
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], CSRF_FAILED)
+        self.assertFalse(self.signed_in())
+
+    def test_a_token_from_the_csrf_route_lets_it_through(self):
+        token = self.client.get("/api/csrf/", HTTP_HOST=PORTAL).json()["csrf_token"]
+
+        response = self.sign_in(HTTP_X_CSRFTOKEN=token)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.signed_in())
+
+    def test_the_csrf_route_sets_the_cookie_it_hands_out(self):
+        """A token with no cookie to compare it against is not a check."""
+        response = self.client.get("/api/csrf/", HTTP_HOST=PORTAL)
+
+        self.assertIn("csrftoken", response.cookies)
+
+    def test_a_refused_sign_in_is_not_counted_as_a_guess(self):
+        """It never reached the password. Counting it would let anybody spend
+        somebody else's window without knowing a single credential."""
+        self.sign_in()
+
+        self.assertEqual(SignInAttempts.objects.count(), 0)
 
 
 class RefusalSaysNothingTests(SignInSetUp):

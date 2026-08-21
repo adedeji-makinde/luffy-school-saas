@@ -17,3 +17,13 @@ class AccountsConfig(AppConfig):
         # happens to import the module is not a check. These are `deploy=True`,
         # so registering them costs nothing until `manage.py check --deploy`.
         from . import checks  # noqa: F401
+
+        # Put the throttle on the admin's login form. Done here rather than in
+        # an `accounts/admin.py` picked up by `admin.autodiscover()`, on the
+        # same reasoning as the two above: this is a security control, and one
+        # that only takes effect if a module happens to be imported is not one.
+        from django.contrib import admin
+
+        from .forms import ThrottledAdminAuthenticationForm
+
+        admin.site.login_form = ThrottledAdminAuthenticationForm

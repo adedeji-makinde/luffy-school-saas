@@ -311,6 +311,31 @@ happens on the portal and the work happens on a school's own host, so a client t
 check. An unauthenticated logout is a route any other origin can aim at a signed-in
 teacher's browser to throw away the session they are marking with.
 
+**`/api/login/` is CSRF-checked too, by hand.** ninja exempts its own views from Django's
+CSRF middleware and does the check inside cookie authentication instead — which the one
+route you use *before* you have a cookie does not have. So the view calls `check_csrf()`
+itself, and `GET /api/csrf/` exists to give a client with no template somewhere to get a
+token. The attack this closes runs the opposite way to the usual one: the attacker does
+not steal a session, they give the victim one of *theirs*, and a teacher whose browser is
+quietly signed in as somebody else marks a class of thirty into an account the attacker
+reads at leisure. `SameSite` does not help, because the forged request needs no cookie of
+ours to succeed — it sets one. The cost is one round trip before a client's first sign-in,
+which is exactly what Django's own `LoginView` has always required.
+
+**The admin is a sign-in door as well, and it is held to the same policy.** Django's admin
+authenticates through `AuthenticationForm`, which never passes near `accounts/signin.py` —
+so for as long as both existed, `/admin/login/` took unlimited guesses and recorded
+nothing, against the `is_platform_staff` accounts that are the only ones able to reach
+every school's data at once. `accounts/forms.py` now runs the same three throttle calls
+the endpoint does, sharing one window per identifier rather than keeping a second count
+that would make the limit quietly twice what it says.
+
+It is also served **on the portal only** now, by routing rather than by a check inside a
+view: `PUBLIC_SCHEMA_URLCONF` carries the admin and `ROOT_URLCONF` does not, so a school's
+host has no such route. Serving it from a tenant host was worse than untidy — the admin
+edits *shared* tables, so it meant privileged writes to platform-wide rows issued on a
+connection whose `search_path` had been set to one school's schema.
+
 **Sign-in is served on the portal host and nowhere else.** A school's host refuses anyone
 without an active membership *there* (`SchoolAccessMiddleware`); the portal is the one
 host where somebody with no membership anywhere is still let through the door, and where

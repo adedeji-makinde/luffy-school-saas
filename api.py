@@ -41,6 +41,7 @@ from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from ninja import NinjaAPI, Schema
 from ninja.errors import AuthenticationError, HttpError
+from ninja.utils import check_csrf
 
 from accounts import signin
 from accounts.services import NotPermitted
@@ -218,9 +219,35 @@ def _schools_of(user):
     ]
 
 
+#: A request that could not be shown to have been meant by the person sending
+#: it. Fixable by fetching a token from `/api/csrf/` and sending it again.
+CSRF_FAILED = "csrf_failed"
+
+
+class CsrfOut(Schema):
+    csrf_token: str
+
+
+@api.get("/csrf/", response=CsrfOut, auth=None, tags=["session"])
+def csrf_token(request):
+    """Hand out a CSRF token, and set the cookie that goes with it.
+
+    This exists because `/api/login/` needs one and a caller who is not signed
+    in has no way to have got one: ninja exempts its own views from Django's
+    CSRF middleware, so nothing in this API was setting the cookie. Django's
+    templates normally do it, and this API has no templates.
+
+    `GET`, and it has to be: a route whose whole purpose is to be reachable
+    before anybody is authenticated must not change anything. It does not — the
+    token identifies the *browser session*, not the person, and handing one out
+    tells the caller nothing it did not already know about itself.
+    """
+    return CsrfOut(csrf_token=get_token(request))
+
+
 @api.post(
     "/login/",
-    response={200: SignedInOut, 401: RefusedOut, 429: RefusedOut},
+    response={200: SignedInOut, 401: RefusedOut, 403: RefusedOut, 429: RefusedOut},
     auth=None,
     tags=["session"],
 )
@@ -232,6 +259,31 @@ def sign_in(request, payload: SignInIn):
     caller rather than only for this view.
     """
     _portal_only(request)
+
+    # CSRF, checked here by hand because ninja exempts its views from Django's
+    # middleware and does the check inside cookie auth instead — which this
+    # route, being the one you use *before* you have a cookie, does not have.
+    #
+    # Login CSRF is the attack this closes, and it is worth naming because it
+    # runs the wrong way round: the attacker does not steal a session, they
+    # give the victim one of *theirs*. A teacher whose browser is quietly
+    # signed in as somebody else then marks a class of thirty into an account
+    # the attacker can read at leisure. `SameSite=Lax` does not stop it — the
+    # forged request needs no cookie of ours to succeed, it sets one.
+    #
+    # The cost is that a client must fetch `/api/csrf/` before its first
+    # sign-in. Django's own `LoginView` has always required exactly this, and
+    # the alternative is a door anybody can push somebody else through.
+    if check_csrf(request) is not None:
+        return 403, RefusedOut(
+            detail=(
+                "This sign-in could not be verified as intended. Fetch a token "
+                "from /api/csrf/ and send it as X-CSRFToken."
+            ),
+            code=CSRF_FAILED,
+            retryable=True,
+        )
+
     try:
         user = signin.sign_in(request, payload.identifier, payload.password)
     except signin.TooManyAttempts as exc:
