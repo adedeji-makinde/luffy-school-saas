@@ -163,6 +163,46 @@ def _current(assessment, membership_id):
     ).first()
 
 
+#: SQLSTATE 23505. Named rather than spelled inline at two call sites.
+_UNIQUE_VIOLATION = "23505"
+
+#: The constraint whose firing means "somebody else got there first". Matched by
+#: name, because it is the only one of the eight on this table that means that.
+_COLLISION = "one_score_per_student_per_assessment"
+
+
+def _is_the_first_mark_colliding(exc) -> bool:
+    """Did `one_score_per_student_per_assessment` fire, or something else?
+
+    `IntegrityError` is the table refusing a row, and it says nothing about
+    *which* rule refused it. Exactly one of them — the uniqueness of a mark per
+    student per assessment — means a second writer got there first, which is the
+    conflict `ScoreChangedMeanwhile` describes and the one a caller fixes by
+    reloading. The other seven are the five `CHECK (... >= 0)` constraints, the
+    primary key, and the foreign key onto `Assessment`; reporting any of those
+    as "somebody changed this mark" sends the caller round a reload loop that
+    cannot terminate and buries a real failure behind a routine-looking refusal.
+
+    Asked of the constraint that actually fired, via psycopg2's `diag`, rather
+    than inferred from whether a row is there now. The inference is a proxy and
+    wrong in both directions: a genuine collision whose row is cleared in the
+    moment between the failed insert and the check looks like a real failure,
+    and a `CHECK` violation on a student who *does* already have a mark looks
+    like a collision. The constraint name is the fact itself.
+
+    Postgres-only, like the rest of this codebase — `django_tenants` puts each
+    school in its own schema and no other backend has those. A cause that
+    carries no `pgcode` is treated as "not a collision", so an unrecognised
+    error is re-raised intact rather than relabelled as a conflict.
+    """
+    cause = exc.__cause__
+    diagnostics = getattr(cause, "diag", None)
+    return (
+        getattr(cause, "pgcode", None) == _UNIQUE_VIOLATION
+        and getattr(diagnostics, "constraint_name", None) == _COLLISION
+    )
+
+
 def set_score(assessment, membership, value, *, expected_version=None, by=None):
     """Enter or change one student's mark on one assessment. Returns the `Score`.
 
@@ -205,14 +245,26 @@ def _insert_first_mark(assessment, membership_id, value, by):
                 recorded_by_id=_stamp(by),
                 updated_by_id=_stamp(by),
             )
-    except IntegrityError:
-        # `one_score_per_student_per_assessment` fired: somebody entered the
-        # first mark between the caller being shown the sheet and this write.
+    except IntegrityError as exc:
+        # Which IntegrityError, though? Only the uniqueness collision means
+        # somebody entered the first mark between the caller being shown the
+        # sheet and this write. Anything else is a real failure and leaves here
+        # untouched — see `_is_the_first_mark_colliding()` for why that is asked
+        # of the constraint rather than of whether a row is there now.
+        if not _is_the_first_mark_colliding(exc):
+            raise
+        # `current` can still be None: the row this collided with may have been
+        # cleared in the moment since. That is a different sentence, not a
+        # different outcome — the caller's write did not happen either way.
         current = _current(assessment, membership_id)
+        stands_at = (
+            "has been marked and cleared since"
+            if current is None
+            else f"now stands at {current.value}/{assessment.max_score}"
+        )
         raise ScoreChangedMeanwhile(
-            f"This was unmarked when you opened it and now stands at "
-            f"{current.value if current else 'a mark that has since been cleared'}"
-            f". Reload before entering it again.",
+            f"This was unmarked when you opened it and {stands_at}. Reload "
+            f"before entering it again.",
             current=current,
         ) from None
 
@@ -282,7 +334,13 @@ def _write_regardless(assessment, membership_id, value, by):
                     recorded_by_id=_stamp(by),
                     updated_by_id=_stamp(by),
                 )
-        except IntegrityError:
+        except IntegrityError as exc:
+            # Same question as `_insert_first_mark()`, and it matters more here
+            # because this path retries: a constraint that is not the collision
+            # will fail again on the second pass and every pass after it, so
+            # retrying it only delays the error and then mislabels it.
+            if not _is_the_first_mark_colliding(exc):
+                raise
             if attempt == 2:
                 raise ScoreChangedMeanwhile(
                     "This mark is being written by somebody else faster than it "

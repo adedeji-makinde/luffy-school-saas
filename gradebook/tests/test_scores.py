@@ -316,6 +316,67 @@ class ConcurrentEditTests(GradebookSetUp):
 
             self.assertEqual(Score.objects.get().value, 15)
 
+    def test_an_integrity_error_that_is_not_a_collision_is_not_called_one(self):
+        """Only a uniqueness collision is a conflict. The rest are real failures.
+
+        The insert path catches `IntegrityError` and reads it as "somebody
+        entered the first mark while you were typing", which is right for the
+        one constraint it was written for and wrong for the other seven ways
+        this table can refuse a row. Telling a caller to reload when the real
+        problem is a malformed row sends them round a loop that cannot
+        terminate, and buries the actual error underneath a routine-looking
+        refusal.
+
+        `recorded_by_id` is a bare id with a `CHECK (... >= 0)` behind it and no
+        foreign key (docs/tenancy.md), so a negative stamp is refused by the
+        table at INSERT — a genuine, synchronous, non-collision `IntegrityError`
+        of exactly the kind that must not be relabelled.
+        """
+        with connected_to(self.stmarys):
+            assessment = self.exam()
+
+            with self.assertRaises(IntegrityError):
+                services.set_score(assessment, self.ada, 15, by=-1)
+
+            self.assertFalse(
+                Score.objects.exists(), "the refused row must not have landed"
+            )
+
+    def test_the_same_holds_for_a_write_that_skips_the_version_check(self):
+        """`ANY_VERSION` retries, and a retry must not paper over a real error.
+
+        Worse here than on the insert path: a constraint that is not the
+        collision fails identically on the second pass, so retrying it only
+        delays the error before mislabelling it.
+        """
+        with connected_to(self.stmarys):
+            assessment = self.exam()
+
+            with self.assertRaises(IntegrityError):
+                services.set_score(
+                    assessment,
+                    self.ada,
+                    15,
+                    expected_version=services.ANY_VERSION,
+                    by=-1,
+                )
+
+    def test_a_collision_is_still_told_apart_from_the_rest(self):
+        """The other half of the discrimination: the real conflict still reports.
+
+        Narrowing `except IntegrityError` is only correct if the constraint it
+        was written for still lands in it. A test that only proves things are
+        re-raised would pass just as well if nothing were ever caught at all.
+        """
+        with connected_to(self.stmarys):
+            assessment = self.exam()
+            services.set_score(assessment, self.ada, 15)
+
+            with self.assertRaises(services.ScoreChangedMeanwhile) as caught:
+                services.set_score(assessment, self.ada, 18)
+
+            self.assertEqual(caught.exception.current.value, 15)
+
     def test_a_refusal_leaves_the_surrounding_transaction_usable(self):
         """A whole sheet is one transaction, and one refused cell is not fatal.
 
@@ -626,3 +687,79 @@ class MigrationStabilityTests(TestCase):
                         f"{name} does not survive being written to a migration "
                         f"and read back, so makemigrations will propose it forever",
                     )
+
+
+class ConstraintTimingTests(GradebookSetUp):
+    """*When* a constraint fires, which decides what `set_score()` can catch.
+
+    `_insert_first_mark()` turns one specific `IntegrityError` into
+    `ScoreChangedMeanwhile` and re-raises the rest. That is only coherent if the
+    collision actually reaches the `except` block, and Postgres decides that:
+    an immediate constraint fires at the statement, a deferred one fires at
+    COMMIT — long after the handler has returned.
+
+    Both facts below are load-bearing and neither is visible in `models.py`, so
+    they are pinned here. If a future migration makes the unique constraint
+    deferrable, the conflict path silently stops working and every 409 this
+    module promises becomes a 500 at commit time; this test fails first.
+    """
+
+    def _timing_of(self, where, params):
+        """(deferrable, deferred) for the one constraint matching `where`."""
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT condeferrable, condeferred
+                FROM pg_constraint
+                WHERE conrelid = 'gradebook_score'::regclass AND {where}
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+        self.assertEqual(len(rows), 1, f"expected exactly one match for {where}")
+        return rows[0]
+
+    def test_the_collision_fires_at_the_statement_not_at_commit(self):
+        with connected_to(self.stmarys):
+            deferrable, deferred = self._timing_of(
+                "conname = %s", ["one_score_per_student_per_assessment"]
+            )
+
+        self.assertFalse(
+            deferrable or deferred,
+            "the uniqueness collision must raise inside set_score(), not at "
+            "commit — the whole conflict path is built on catching it there",
+        )
+
+    def test_the_assessment_foreign_key_is_deferred_and_so_cannot_be_tested_here(self):
+        """Documented because it is the trap, not because anything relies on it.
+
+        Django writes every foreign key as DEFERRABLE INITIALLY DEFERRED, so a
+        `Score` pointing at an assessment deleted a moment ago does *not* fail at
+        the INSERT. It fails at COMMIT — and *where* that lands depends on who
+        opened the transaction:
+
+        - In production there is no `ATOMIC_REQUESTS`, so the `transaction
+          .atomic()` inside `_insert_first_mark()` is the outermost one. Exiting
+          it is a real COMMIT, the violation is raised there, and it *does* reach
+          the `except IntegrityError` handler. Classifying it correctly matters.
+        - Under `TestCase` every test already runs in a transaction, so that same
+          block is only a savepoint. Nothing commits, the violation is held until
+          teardown, and the handler never sees it.
+
+        So the case is real and the handler must get it right, but it cannot be
+        provoked from here: a test that deletes the assessment and expects an
+        error reports "IntegrityError not raised" and then errors in teardown,
+        which reads like a bug in the code under test and is not one. Pinned as
+        a schema fact instead, with the classification itself covered by the
+        `CHECK` constraint tests in `ConcurrentEditTests`, which do fire at the
+        statement.
+        """
+        with connected_to(self.stmarys):
+            # By type, not by name: Django hashes the column into the name, so
+            # spelling it out here would be a test that breaks on a rename
+            # rather than on the behaviour it is about. `Score` has exactly one
+            # foreign key — the bare ids have none, by design.
+            deferrable, deferred = self._timing_of("contype = 'f'", [])
+
+        self.assertTrue(deferrable and deferred)

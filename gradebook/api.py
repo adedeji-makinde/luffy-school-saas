@@ -230,6 +230,42 @@ def _cell(assessment, student_membership_id, score, total) -> dict:
     }
 
 
+#: What a caller who may not mark is told, on both write routes.
+#:
+#: One string, because it is now the answer to two different questions — "may
+#: you mark?" and "does that assessment exist?" — and the whole point of the
+#: gate below is that those two are indistinguishable from outside. Two copies
+#: that drifted by a word would hand back exactly the difference the gate exists
+#: to remove.
+#:
+#: Deliberately not `services.NotAllowedToMark`'s text, which names the actor and
+#: the school; that belongs in a log, not in a response body.
+_MAY_NOT_MARK = (
+    "Marking is done by a teacher, a principal or an administrator of the "
+    "school that set the assessment."
+)
+
+
+def _refuse_non_markers(request, school):
+    """The authority check, before either lookup. Returns a response or None.
+
+    Order is the whole point. `get_object_or_404()` answers 404 for a row that is
+    not there and lets the request go on to a 403 for one that is — so asking
+    authority *second* turns both write routes into an existence oracle for
+    anybody signed in at the school, parents and students included. They could
+    not write a mark either way, but they could walk the id space and learn which
+    assessments and which student memberships are real by reading the status
+    code. `marking_sheet()` has always gated first; these two now match it.
+
+    Narrow on purpose: it closes on non-markers only. A teacher still gets a 404
+    for an assessment that is not there, because for them that is a fact they are
+    entitled to and the honest answer to their own typo.
+    """
+    if services.can_enter_marks(request.user, school):
+        return None
+    return 403, MessageOut(detail=_MAY_NOT_MARK)
+
+
 def _is_our_write_arriving_twice(current, payload, actor) -> bool:
     """A retried blur, not a conflict.
 
@@ -339,6 +375,9 @@ def save_score(
     kind of idempotent.
     """
     school = _school_of(request)
+    refused = _refuse_non_markers(request, school)
+    if refused is not None:
+        return refused
     assessment = get_object_or_404(Assessment, pk=assessment_id)
     student = _student_here(school, student_membership_id)
 
@@ -416,6 +455,9 @@ def clear_score(
     this feature exists to fix.
     """
     school = _school_of(request)
+    refused = _refuse_non_markers(request, school)
+    if refused is not None:
+        return refused
     assessment = get_object_or_404(Assessment, pk=assessment_id)
     student = _student_here(school, student_membership_id)
 

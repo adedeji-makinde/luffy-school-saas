@@ -283,6 +283,72 @@ class SavingOneMarkTests(GradebookApiSetUp):
         self.assertNotIn("Grace", response.content.decode())
 
 
+class ExistenceOracleTests(GradebookApiSetUp):
+    """A refused caller learns nothing about what exists.
+
+    Both write routes look an assessment and a student up before anything asks
+    whether the caller may mark at all. Left that way, the status code answers a
+    question the caller was never allowed to ask: 404 for a row that is not
+    there, 403 for one that is. Anybody signed in at the school can read that
+    difference — a parent, a student, a bursar — and walk the id space of their
+    own school's assessments and student memberships without ever being able to
+    write a mark.
+
+    `marking_sheet()` has always gated first. These two now match it, so every
+    refusal a non-marker can provoke is the same 403 whatever is behind it.
+    """
+
+    ABSENT = 10**9
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.parent.user)
+
+    def test_a_parent_cannot_tell_a_real_assessment_from_an_invented_one(self):
+        real = self.save(self.ada.pk, 15)
+        invented = self.save(self.ada.pk, 15, assessment_id=self.ABSENT)
+
+        self.assertEqual(real.status_code, 403)
+        self.assertEqual(invented.status_code, 403)
+
+    def test_a_parent_cannot_tell_a_student_from_a_stranger(self):
+        student = self.save(self.ada.pk, 15)
+        stranger = self.save(self.ABSENT, 15)
+        # A membership at this school that is not a student's: found by the
+        # id lookup, refused by the role filter. Also a 403 now.
+        not_a_student = self.save(self.teacher.pk, 15)
+
+        self.assertEqual(student.status_code, 403)
+        self.assertEqual(stranger.status_code, 403)
+        self.assertEqual(not_a_student.status_code, 403)
+
+    def test_clearing_gives_nothing_away_either(self):
+        real = self.clear(self.ada.pk, expected_version=1)
+        invented = self.clear(
+            self.ada.pk, expected_version=1, assessment_id=self.ABSENT
+        )
+        stranger = self.clear(self.ABSENT, expected_version=1)
+
+        self.assertEqual(real.status_code, 403)
+        self.assertEqual(invented.status_code, 403)
+        self.assertEqual(stranger.status_code, 403)
+
+    def test_a_teacher_still_gets_a_404_for_something_that_is_not_there(self):
+        """The gate closes on non-markers, not on everyone.
+
+        A teacher may mark, so for them "no such assessment" is a fact they are
+        entitled to and 404 is the honest answer. Without this, hoisting the
+        authority check could have been "return 403 to everybody", which hides
+        the caller's own typo from the one person who can act on it.
+        """
+        self.client.force_login(self.teacher.user)
+
+        self.assertEqual(
+            self.save(self.ada.pk, 15, assessment_id=self.ABSENT).status_code, 404
+        )
+        self.assertEqual(self.save(self.ABSENT, 15).status_code, 404)
+
+
 class RetriedBlurTests(GradebookApiSetUp):
     """Blur fires twice for one edit. That is not two teachers.
 

@@ -80,6 +80,32 @@ between. And the insert runs in its own `transaction.atomic()` block, because an
 wrapping a whole sheet in `atomic()` and catching the refusal could not go on to
 write the next student.
 
+**Only one `IntegrityError` is a conflict.** `gradebook_score` carries eight
+constraints and exactly one of them —
+`one_score_per_student_per_assessment` — means "somebody else got there first".
+The other seven are five `CHECK (... >= 0)` constraints, the primary key, and the
+foreign key onto `Assessment`. Catching `IntegrityError` and reporting all of them
+as `ScoreChangedMeanwhile` tells a caller to reload when reloading cannot help,
+and buries a real failure behind a routine-looking refusal — so
+`_is_the_first_mark_colliding()` asks *which* constraint fired, via psycopg2's
+`diag.constraint_name`, and anything else is re-raised untouched.
+
+It asks the constraint rather than inferring from whether a row is there now,
+because the inference is wrong in both directions: a genuine collision whose row
+is cleared in the intervening moment looks like a real failure, and a `CHECK`
+violation against a student who already has a mark looks like a collision.
+
+One piece of timing this rests on, pinned by `ConstraintTimingTests` because it is
+invisible in `models.py`: the unique constraint is **immediate**, so it is raised
+by the INSERT and lands in the handler. Django writes foreign keys as `DEFERRABLE
+INITIALLY DEFERRED`, so an FK violation is raised at COMMIT instead. In production
+that still reaches the handler — there is no `ATOMIC_REQUESTS`, so the block's own
+`atomic()` is the outermost transaction and exiting it commits. Under `TestCase`
+it does not: the block is only a savepoint, nothing commits, and the violation
+surfaces in teardown. Which is why the FK case is covered by a schema assertion
+rather than by a test that provokes it, and why one that tries reports
+"IntegrityError not raised" and then errors in teardown.
+
 `ANY_VERSION` is the escape hatch, for a bulk import or a data migration where
 there is no screen and nobody to conflict with. It is a **sentinel, not
 `expected_version=None`**, because `None` already means "I was shown no mark".
@@ -173,6 +199,20 @@ actually attend — correct for a log and a test, and a cross-tenant leak if it 
 reached an HTTP caller. So the endpoint scopes the lookup to this school and to
 `STUDENT` up front, and the refusal never gets that far. Same reasoning as the
 flat `404` the invitation routes answer a bad token with.
+
+**Authority is asked before either lookup, and the order is load-bearing.**
+`get_object_or_404()` answers `404` for a row that is not there and lets the
+request carry on to a `403` for one that is. Ask authority second and both write
+routes become an existence oracle for anybody signed in at the school — a parent,
+a student, a bursar — who can walk the id space and learn which assessments and
+which student memberships are real by reading the status code, without ever being
+able to write a mark. `marking_sheet()` always gated first; `save_score()` and
+`clear_score()` now do too, via `_refuse_non_markers()`.
+
+The gate closes on non-markers only. A teacher still gets a `404` for an
+assessment that is not there, because for somebody who may mark, that is a fact
+they are entitled to and the honest answer to their own typo. "Return `403` to
+everybody" would have hidden the typo from the one person who could fix it.
 
 **No school slug in any path**, unlike `/api/schools/{slug}/...`. Those routes
 write shared tables, where the school is a row that has to be named. The gradebook
