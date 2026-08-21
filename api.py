@@ -1,4 +1,10 @@
-"""The HTTP surface: staff invitations here, the gradebook in its own module.
+"""The HTTP surface: sign-in and staff invitations here, the gradebook in its own module.
+
+`/api/login/` and `/api/logout/` are the door. Sign-in is unauthenticated by
+definition and is served on the **portal host only** — see `_portal_only()` for
+why that is a rule about which schools a login reaches rather than a routing
+preference. Sign-out is authenticated, which is what puts it behind a CSRF
+check.
 
 The invitation endpoints are five, in two halves that differ in who is on the
 other end.
@@ -29,17 +35,21 @@ docstring has the argument in full.
 
 from typing import Optional
 
+from django.contrib.auth import logout as end_session
 from django.http import Http404
+from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from ninja import NinjaAPI, Schema
 from ninja.errors import AuthenticationError, HttpError
 
+from accounts import signin
 from accounts.services import NotPermitted
 from accounts.session import SESSION_EXPIRED, session_auth, why_unauthenticated
-from gradebook.api import router as gradebook_router
+from gradebook.api import MessageOut, router as gradebook_router
 from schools import invitations as invitation_service
 from schools.delivery import NoDeliveryAddress
 from schools.models import (
+    Domain,
     Invitation,
     InvitationError,
     InviteeDeactivated,
@@ -99,6 +109,173 @@ def unauthenticated(request, exc):
         },
         status=401,
     )
+
+
+# -- signing in and out ------------------------------------------------------
+
+
+class SignInIn(Schema):
+    """One field for the identifier, because there is one sign-in door.
+
+    Not `email` / `phone` / `username` as three fields: staff reach for their
+    email, parents for the phone number the school has on file, and a student
+    for a school-issued handle that is neither. `User.matching_identifier()`
+    resolves all three, and asking the person to first classify what they are
+    about to type would be asking them to know something about our schema.
+    """
+
+    identifier: str
+    password: str
+
+
+class SchoolOut(Schema):
+    """A school this login may act at, and where to go to do it.
+
+    `host` is the reason this is not just a list of names. Sign-in happens on
+    the portal and the work happens on a school's own host, so a client that is
+    told only "St Mary's" still cannot get the teacher back to their marking
+    sheet. It is `None` for a school with no primary domain registered — a
+    setup fault rather than an ordinary state, and one this endpoint reports by
+    omission rather than by refusing to sign somebody in.
+    """
+
+    slug: str
+    name: str
+    host: Optional[str] = None
+
+
+class SignedInOut(Schema):
+    """What a client gets back, which is what it needs to do anything next.
+
+    `csrf_token` is here because every authenticated route in this API is
+    cookie-authenticated and therefore CSRF-checked (ninja's `SessionAuth`
+    does the check itself, since ninja exempts its own views from Django's
+    middleware). `login()` rotates the token and the response carries the
+    cookie, but a client that cannot read that cookie — `CSRF_COOKIE_HTTPONLY`
+    is one setting away — would have a session it could not use for anything
+    but GETs. Returning the token makes the endpoint sufficient on its own.
+    It is not a secret: it defends against another origin making the request,
+    not against the person holding it reading it.
+    """
+
+    full_name: str
+    schools: list[SchoolOut]
+    csrf_token: str
+
+
+class RefusedOut(Schema):
+    """A sign-in that did not happen, in the shape the 401 handler already uses.
+
+    Same four keys as every other refusal from this API — `detail` for a
+    person, `code` to branch on, `retryable` for whether sending it again could
+    ever help — so a client has one refusal shape to handle rather than two.
+    `retry_after` is whole seconds, and only present when waiting is the thing
+    that fixes it.
+    """
+
+    detail: str
+    code: str
+    retryable: bool
+    retry_after: Optional[int] = None
+
+
+def _portal_only(request):
+    """Sign-in is served on the portal host and nowhere else.
+
+    The portal is where a parent with children at three schools signs in once
+    and reaches all of them, and — per `SchoolAccessMiddleware` — the one host
+    where somebody with no membership anywhere is still allowed through the
+    door. A school's host is the opposite by design: it refuses anyone without
+    an active membership *there*, so serving sign-in from it would mean the
+    same credentials worked on one hostname and not another, and a teacher who
+    is also a parent elsewhere would need two sessions to see their own child.
+
+    A 404 rather than a 403, matching the gradebook's answer on the portal:
+    the route does not exist on this host. Where it does exist is the client's
+    own deployment configuration — it knows its portal host, and having the
+    server name it would put the same fact in two places.
+    """
+    if getattr(request, "school", None) is not None:
+        raise Http404("Sign in on the portal host.")
+
+
+def _schools_of(user):
+    """Every school this login may act at, with the host each one lives on.
+
+    Two queries regardless of how many schools, which matters for the parent
+    this shape exists for. `is_primary` because a school may answer on several
+    hostnames and only one of them is the one to send somebody to.
+    """
+    schools = list(user.schools())
+    hosts = dict(
+        Domain.objects.filter(tenant__in=schools, is_primary=True).values_list(
+            "tenant_id", "domain"
+        )
+    )
+    return [
+        SchoolOut(slug=school.slug, name=school.name, host=hosts.get(school.pk))
+        for school in schools
+    ]
+
+
+@api.post(
+    "/login/",
+    response={200: SignedInOut, 401: RefusedOut, 429: RefusedOut},
+    auth=None,
+    tags=["session"],
+)
+def sign_in(request, payload: SignInIn):
+    """Exchange an identifier and password for a session.
+
+    The rules — one refusal for every kind of failure, a throttle that counts
+    rather than locks — are in `accounts/signin.py`, where they hold for any
+    caller rather than only for this view.
+    """
+    _portal_only(request)
+    try:
+        user = signin.sign_in(request, payload.identifier, payload.password)
+    except signin.TooManyAttempts as exc:
+        response = api.create_response(
+            request,
+            {
+                "detail": str(exc),
+                "code": signin.TOO_MANY_ATTEMPTS,
+                "retryable": True,
+                "retry_after": exc.retry_after,
+            },
+            status=429,
+        )
+        # The standard header as well as the field, for the clients and proxies
+        # that honour it without reading the body.
+        response["Retry-After"] = str(exc.retry_after)
+        return response
+    except signin.BadCredentials as exc:
+        return 401, RefusedOut(
+            detail=str(exc), code=signin.BAD_CREDENTIALS, retryable=False
+        )
+
+    return 200, SignedInOut(
+        full_name=user.full_name,
+        schools=_schools_of(user),
+        csrf_token=get_token(request),
+    )
+
+
+@api.post("/logout/", response=MessageOut, auth=session_auth, tags=["session"])
+def sign_out(request):
+    """End the session now rather than waiting for it to lapse.
+
+    Authenticated on purpose, which is what puts it behind ninja's CSRF check:
+    an unauthenticated logout is a route any other origin can aim at a signed-in
+    teacher's browser to throw away the session they are marking with. A caller
+    whose session has *already* gone gets the ordinary `session_expired` 401,
+    which is a true answer to "sign me out" — there is nothing left to end.
+
+    `logout()` flushes the session rather than only forgetting the user, so the
+    key that comes back is not one that was ever signed in.
+    """
+    end_session(request)
+    return MessageOut(detail="Signed out.")
 
 
 # -- request and response shapes ---------------------------------------------

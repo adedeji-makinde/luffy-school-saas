@@ -879,3 +879,58 @@ class TransferRequest(models.Model):
         """The side that asked calls it off. The enrolment is untouched."""
         self._lock_pending()
         return self._record_answer(by, TransferRequestStatus.WITHDRAWN)
+
+
+class SignInScope(models.TextChoices):
+    """The two things a run of failed sign-ins is counted against.
+
+    Two, not one, because they answer different questions. IDENTIFIER bounds
+    how many guesses one account can absorb; ADDRESS bounds how many guesses
+    one machine can make across all accounts, which is the credential-stuffing
+    shape the first one cannot see.
+    """
+
+    IDENTIFIER = "identifier", "Identifier"
+    ADDRESS = "address", "Network address"
+
+
+class SignInAttempts(models.Model):
+    """One row per throttled key, holding a count and the window it counts in.
+
+    A counter rather than a row per attempt, so the table is bounded by the
+    number of distinct keys seen rather than by how hard somebody is trying.
+    That trades away an audit trail; if one is wanted later it belongs in the
+    log stream, not here, where it would be a second copy with different
+    retention.
+
+    **In the public schema, like everything else in this app.** A throttle that
+    lived per-tenant would count each school separately, and sign-in does not
+    happen at a school — it happens on the portal, before any school is chosen.
+
+    **The identifier is stored as a digest, the address in the clear**, and the
+    asymmetry is deliberate. Whatever was typed into the identifier box is not
+    always an identifier: people type their password into it, and a table of
+    those in plain text is a credential store nobody decided to build. Hashing
+    costs nothing here because the key is only ever compared for equality — the
+    same reasoning `schools.models.hash_token()` gives for invitation tokens.
+    An address is not a credential and is the one field an incident is actually
+    investigated from, so it stays readable.
+    """
+
+    scope = models.CharField(max_length=16, choices=SignInScope.choices)
+    key = models.CharField(
+        max_length=255,
+        help_text="SHA-256 of the normalized identifier, or the address itself.",
+    )
+    failures = models.PositiveIntegerField(default=0)
+    window_started_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "key"], name="one_signin_counter_per_key"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.scope}:{self.key} ({self.failures})"

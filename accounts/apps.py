@@ -12,3 +12,8 @@ class AccountsConfig(AppConfig):
         # happens to import the module, and a guard that depends on import
         # order is not a guard.
         from . import deletion  # noqa: F401
+
+        # Same reasoning: a check that is only registered when something else
+        # happens to import the module is not a check. These are `deploy=True`,
+        # so registering them costs nothing until `manage.py check --deploy`.
+        from . import checks  # noqa: F401

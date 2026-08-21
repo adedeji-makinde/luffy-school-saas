@@ -118,6 +118,68 @@ AUTHENTICATION_BACKENDS = ["accounts.backends.IdentifierBackend"]
 SESSION_SAVE_EVERY_REQUEST = True
 SESSION_COOKIE_AGE = 60 * 60 * 12
 
+# **A session belongs to the person, not to one school.** That is not a new
+# decision here; it is the one this project already made and has been relying
+# on. `accounts.Membership` is shared rather than per-tenant precisely so a
+# parent with children at three schools has one login, and
+# `SchoolAccessMiddleware` re-derives what they may do from the host on every
+# request rather than from anything stored in the session. Writing the school
+# into the session would put the same fact in two places, and make the copy in
+# the session the stale one the moment a membership is suspended.
+#
+# What that costs is this setting. Sign-in happens on the portal host (see
+# `/api/login/`), and a cookie with no Domain attribute is returned only to the
+# exact host that set it — so without a domain spanning the portal and every
+# school, a teacher would sign in successfully on the portal and arrive at their
+# own school's host as a stranger. Set it to the parent of every host the
+# platform answers on, with a leading dot: `.luffy.school`.
+#
+# Left unset it is not merely unconfigured, it is wrong in a way that only shows
+# up on the second host, which is why `accounts/checks.py` refuses a production
+# deploy without it rather than letting it be discovered by a teacher. Unset is
+# still right for local single-host development, where it means "this host".
+SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN") or None
+
+# The CSRF cookie has to travel exactly as far as the session it protects.
+CSRF_COOKIE_DOMAIN = SESSION_COOKIE_DOMAIN
+
+# A session cookie is a credential from the moment `/api/login/` can mint one,
+# so it should never cross a plain-HTTP hop. Tied to DEBUG rather than given its
+# own switch: a deployment with DEBUG on has a larger problem than this setting.
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+
+# ---------------------------------------------------------------------------
+# Sign-in throttling
+#
+# The reasoning — counted rather than locked, failures rather than attempts,
+# Postgres rather than the cache — is in `accounts/throttling.py`. These are the
+# numbers, which are the part worth arguing about separately.
+#
+# Ten failures per identifier per quarter-hour: generous for somebody who has
+# genuinely forgotten which of their two passwords this is, and against a
+# ten-character minimum it leaves an attacker roughly a thousand guesses a day
+# against a space where that is nothing.
+#
+# Fifty per address, because a staff room is one NAT address and a limit that a
+# school trips by arriving in the morning would be turned off within a week.
+# Only failures count, so ordinary arrivals never approach it.
+# ---------------------------------------------------------------------------
+SIGN_IN_THROTTLE_WINDOW = int(os.environ.get("SIGN_IN_THROTTLE_WINDOW", 15 * 60))
+SIGN_IN_MAX_FAILURES_PER_IDENTIFIER = int(
+    os.environ.get("SIGN_IN_MAX_FAILURES_PER_IDENTIFIER", 10)
+)
+SIGN_IN_MAX_FAILURES_PER_ADDRESS = int(
+    os.environ.get("SIGN_IN_MAX_FAILURES_PER_ADDRESS", 50)
+)
+
+# How many entries at the right-hand end of `X-Forwarded-For` this deployment's
+# own proxies wrote. Zero — believe nothing, use REMOTE_ADDR — is the only safe
+# default: every hop trusted beyond the ones we actually run is one the caller
+# gets to forge, and forging it is exactly how the per-address limit is escaped.
+# See `accounts.throttling.client_address()`.
+TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", 0))
+
 # Parsing default only, not a restriction: a number typed with no country
 # code is read as Nigerian, but any other country's numbers are still valid.
 # See accounts/identifiers.py.
