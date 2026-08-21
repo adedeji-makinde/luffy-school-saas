@@ -13,6 +13,11 @@ services:
       # SMTP so that a deploy which never sets this fails loudly instead of
       # printing live invitation tokens to the application log.
       EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
+      # Also development only, and explicit for the same reason. settings.py
+      # defaults DEBUG to off and refuses to start without a real
+      # DJANGO_SECRET_KEY, so a deploy that sets neither fails loudly instead
+      # of serving tracebacks signed with a key that is public in this repo.
+      DJANGO_DEBUG: "1"
     depends_on:
       - db
     

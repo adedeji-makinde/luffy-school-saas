@@ -40,6 +40,11 @@ jobs:
       # unlike docker-compose where it is reachable by service name.
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
+      # settings.py refuses to start without this unless DJANGO_DEBUG is on, and
+      # CI deliberately does not turn DEBUG on: running the suite the way a
+      # deployment is configured is the point. Throwaway and public — it signs
+      # nothing that outlives the job.
+      DJANGO_SECRET_KEY: ci-only-not-a-secret-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
 
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +61,21 @@ jobs:
       # would otherwise sail past — the test database is built from the models.
       - name: Check for missing migrations
         run: python manage.py makemigrations --check --dry-run
+
+      # The deployment checklist, including this project's own `accounts.E001`
+      # — the one that refuses a SESSION_COOKIE_DOMAIN-less deploy, because a
+      # session opened on the portal would not be sent to any school's host.
+      # Registered `deploy=True`, so nothing else in this file would ever run
+      # it, and a check nothing runs is close to a check that does not exist.
+      #
+      # This is not a substitute for running it against the real deployment's
+      # environment, which is where the settings actually differ. What it
+      # catches here is a check that has started failing for everybody, and a
+      # setting regressing to a default that fails open.
+      - name: Deployment checks
+        env:
+          SESSION_COOKIE_DOMAIN: .example.test
+        run: python manage.py check --deploy
 
       - name: Run tests
         run: python manage.py test --verbosity 2

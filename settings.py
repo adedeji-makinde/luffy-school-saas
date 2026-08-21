@@ -1,11 +1,59 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 BASE_DIR = Path(__file__).resolve().parent
 
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-not-for-production")
-DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
-ALLOWED_HOSTS = ["*"]
+# ---------------------------------------------------------------------------
+# The three settings a deploy is most likely to forget
+#
+# All three used to have a *convenient* default, which meant a deployment that
+# set none of them started successfully and was wrong in three ways at once.
+# They now fail the way the email backend does (see DEFAULT_EMAIL_BACKEND
+# below): closed, loudly, and with development opting in explicitly rather than
+# production opting out by accident.
+# ---------------------------------------------------------------------------
+
+# **Off unless something says otherwise.** This used to default to on, so a
+# deploy that never set it served tracebacks — settings, environment and all —
+# to anybody who could provoke one. Development turns it on in
+# docker-compose.yml, beside EMAIL_BACKEND, for the same reason and in the same
+# place.
+DEBUG = os.environ.get("DJANGO_DEBUG", "0") == "1"
+
+# **No usable default outside development.** A `SECRET_KEY` is what signs
+# session cookies and CSRF tokens, so a known one is not a weaker key — it is no
+# key at all: anybody holding this repository could mint a session for any
+# account on the platform. That was survivable while sessions only ever came
+# from `force_login()` in tests. It stopped being survivable the moment
+# `/api/login/` could mint one from a password.
+_DEVELOPMENT_SECRET_KEY = "dev-only-not-for-production"
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY") or (
+    _DEVELOPMENT_SECRET_KEY if DEBUG else ""
+)
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY is not set. Refusing to start with a known key: it "
+        "signs every session cookie and CSRF token on the platform. Set it, or "
+        "set DJANGO_DEBUG=1 for local development."
+    )
+
+# **The `Domain` table is the real allowlist**, which is why this could be `*`
+# for as long as it was. `TenantMainMiddleware` resolves every request's host
+# against `schools.Domain` and raises `Http404` for one it does not recognise,
+# before any view runs — so an invented `Host` header is already refused, by
+# data rather than by a list somebody has to remember to update.
+#
+# Kept overridable anyway, for defence in depth and for the paths that do not go
+# through that middleware. `*` remains the default because narrowing it here
+# without narrowing `Domain` buys nothing and would silently break a school the
+# day it is added.
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+    if host.strip()
+]
 
 # ---------------------------------------------------------------------------
 # Tenancy layout
@@ -54,6 +102,10 @@ TENANT_MODEL = "schools.School"
 TENANT_DOMAIN_MODEL = "schools.Domain"
 
 MIDDLEWARE = [
+    # First, as Django asks: it is the one that can end a request before the
+    # rest of the stack has done any work. What it buys here is the header set
+    # — nosniff, referrer policy, and HSTS once a deployment turns it on.
+    "django.middleware.security.SecurityMiddleware",
     "django_tenants.middleware.main.TenantMainMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -63,7 +115,31 @@ MIDDLEWARE = [
     # domain they are on. Must come after AuthenticationMiddleware.
     "accounts.middleware.SchoolAccessMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
+    # Last, so the header lands on whatever the stack finally produced. There is
+    # nothing on this platform that belongs in somebody else's frame, and the
+    # admin — a form that performs privileged writes on submit — is the exact
+    # thing clickjacking is for.
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
+
+# ---------------------------------------------------------------------------
+# Transport and header hardening
+#
+# Set here where the answer is the same everywhere, and deliberately left unset
+# where it is a fact about a deployment's topology rather than about this
+# application.
+#
+# `SECURE_HSTS_SECONDS` and `SECURE_SSL_REDIRECT` are the two left out. Both
+# depend on where TLS is terminated and whether the load balancer already
+# redirects; turning on the redirect in a process that is *behind* a terminator
+# that does not set `X-Forwarded-Proto` produces an infinite redirect, and HSTS
+# is close to irreversible for the length of its own max-age. `manage.py check
+# --deploy` reports both as warnings, which is the right loudness for a decision
+# somebody has to make with the infrastructure in front of them.
+# ---------------------------------------------------------------------------
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
 
 AUTH_USER_MODEL = "accounts.User"
 
@@ -185,7 +261,11 @@ TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", 0))
 # See accounts/identifiers.py.
 PHONE_DEFAULT_REGION = os.environ.get("PHONE_DEFAULT_REGION", "NG")
 
+# Two urlconfs, chosen by schema rather than by anything a view has to check.
+# `urls` is what a school's host serves; `urls_public` replaces it on the public
+# schema — the portal — and is the only one carrying the admin. See both files.
 ROOT_URLCONF = "urls"
+PUBLIC_SCHEMA_URLCONF = "urls_public"
 
 # ---------------------------------------------------------------------------
 # Invitations
