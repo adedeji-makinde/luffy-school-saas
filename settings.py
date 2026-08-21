@@ -91,6 +91,26 @@ INVITATION_CHANNEL = os.environ.get(
     "INVITATION_CHANNEL", "schools.delivery.EmailChannel"
 )
 
+#: Where the accept page lives, as a template containing `{token}`.
+#:
+#: This used to be built with `request.build_absolute_uri()` at the two API call
+#: sites, which made the origin of a live credential a property of *whichever
+#: host the issuing admin happened to be signed in on*. `TenantMainMiddleware`
+#: resolves the portal host and a school's own host differently, so the same
+#: flow emitted `http://testserver/invitations/...` or
+#: `http://stmarys.luffy.school/invitations/...` depending on where the admin was
+#: standing — for a page that is meant to live on a frontend which may be on
+#: neither of them, and which no urlconf in this project serves.
+#:
+#: There is deliberately **no default**. Every candidate default is wrong
+#: somewhere: a hard-coded origin is wrong for every deploy that is not ours, and
+#: falling back to the request host is the bug this setting exists to remove. So
+#: an unset value is a misconfiguration and is refused — see
+#: `invitations.configured_accept_url()`, which raises *before* the transaction
+#: commits, so a deploy that never sets this creates no orphaned placeholder
+#: accounts while failing.
+INVITATION_ACCEPT_URL = os.environ.get("INVITATION_ACCEPT_URL")
+
 #: Not the console backend, which is what this used to default to. An invite
 #: link is a live credential, and the console backend writes the whole message
 #: — accept URL, token and all — to stdout, which in a container is the
@@ -106,6 +126,28 @@ DEFAULT_EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 
 EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", DEFAULT_EMAIL_BACKEND)
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@luffy.school")
+
+#: Where that SMTP backend connects. Django's own defaults are `localhost:25`
+#: with no credentials, which is not a mail server anywhere this runs — so the
+#: deploy that sets `EMAIL_BACKEND` nowhere (the intended path, since SMTP is the
+#: default above) got `ConnectionRefusedError` on every single invitation.
+#:
+#: Which host and which credentials is a deployment decision and stays one:
+#: these are read from the environment and have no in-repo values. What is *not*
+#: left to the deploy is what happens when they are missing — `EmailChannel`
+#: refuses to accept an invitation it has nowhere to send, before the
+#: transaction commits, rather than raising from inside an `on_commit` callback
+#: where nothing can be undone. See `delivery.EmailChannel.check_configured()`.
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "1") == "1"
+EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "0") == "1"
+#: Bounded on purpose. `send()` runs in the request/response cycle via
+#: `on_commit`, so an unreachable mail host with no timeout holds the worker for
+#: as long as the OS lets the connection hang.
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
 
 DATABASES = {
     "default": {

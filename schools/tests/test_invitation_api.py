@@ -14,8 +14,10 @@ even have a password yet — for them the token is the credential.
 """
 
 from datetime import timedelta
+from unittest import mock
 
-from django.test import TestCase, override_settings
+from django.core import mail
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from accounts.deletion import deactivate_user
@@ -28,7 +30,17 @@ from schools.tests.test_invitations import RecordingChannel, make_school
 PASSWORD = "correct-horse-battery"
 
 
-@override_settings(INVITATION_CHANNEL="schools.tests.test_invitations.RecordingChannel")
+#: The accept page's origin, which `settings.INVITATION_ACCEPT_URL` now pins and
+#: `api.py` no longer derives from the request. Set here rather than in the
+#: environment so the suite states its own expectation: these tests assert the
+#: delivered link is *this*, whatever host the admin posted from.
+ACCEPT_URL = "https://portal.example.school/invitations/{token}/"
+
+
+@override_settings(
+    INVITATION_CHANNEL="schools.tests.test_invitations.RecordingChannel",
+    INVITATION_ACCEPT_URL=ACCEPT_URL,
+)
 class InvitationApiTests(TestCase):
     def setUp(self):
         RecordingChannel.sent = []
@@ -60,16 +72,25 @@ class InvitationApiTests(TestCase):
         }
         payload.update(overrides)
         slug = payload.pop("slug", "st-marys")
+        # The host the admin happens to be standing on. It used to decide the
+        # origin of the link in the mail; `AcceptLinkOriginTests` pins that it
+        # no longer does, which is why this is reachable at all.
+        host = payload.pop("host", None)
+        extra = {"HTTP_HOST": host} if host else {}
         with self.captureOnCommitCallbacks(execute=True):
             response = self.client.post(
                 f"/api/schools/{slug}/invitations/",
                 data=payload,
                 content_type="application/json",
+                **extra,
             )
         return response
 
     def raw_token_of_last_invite(self):
         return RecordingChannel.sent[-1]["raw_token"]
+
+    def accept_url_of_last_invite(self):
+        return RecordingChannel.sent[-1]["accept_url"]
 
     # -- POST /api/schools/{slug}/invitations/ --------------------------------
 
@@ -628,3 +649,249 @@ class InvitationApiTests(TestCase):
             Membership.objects.get(user__email="new.teacher@example.com").status,
             MembershipStatus.INVITED,
         )
+
+
+@override_settings(
+    INVITATION_CHANNEL="schools.tests.test_invitations.RecordingChannel",
+    INVITATION_ACCEPT_URL=ACCEPT_URL,
+)
+class AcceptLinkOriginTests(TestCase):
+    """Finding #6: the link in the mail followed whichever host the admin used.
+
+    `api.py` built it with `request.build_absolute_uri()`, so an admin on the
+    portal host and the same admin on their school's own host issued links on
+    two different origins — for an accept page that lives on a frontend which
+    may be on neither, and which no urlconf in this project serves. Nothing
+    pinned the path either: the service tests used `https://portal/i/{token}/`
+    while `api.py` emitted `/invitations/{token}/`, and no test asserted either.
+
+    Two hosts are registered below, both resolving to the public portal tenant.
+    That is enough to prove the property — `build_absolute_uri()` answers with
+    whatever `Host` it was given, so these two requests produced two different
+    links before the fix — and it avoids needing a real `CREATE SCHEMA` for a
+    question that has nothing to do with schemas.
+    """
+
+    def setUp(self):
+        RecordingChannel.sent = []
+
+        portal = School(name="Portal", slug="portal", schema_name="public")
+        portal.auto_create_schema = False
+        portal.save()
+        Domain.objects.create(tenant=portal, domain="testserver", is_primary=True)
+        # A second way in to the same tenant. An admin who follows a bookmark to
+        # one of these rather than the other must not thereby change what every
+        # invitee receives.
+        Domain.objects.create(tenant=portal, domain="admin.testserver")
+
+        self.stmarys = make_school("St Mary's", "st-marys", "st_marys")
+        self.admin = User.objects.create_user(
+            "admin@st-marys.school",
+            PASSWORD,
+            full_name="Ada Admin",
+            email="admin@st-marys.school",
+        )
+        grant_membership(self.admin, self.stmarys, Role.ADMIN)
+        self.client.force_login(self.admin)
+
+    def invite_from(self, host, email):
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                "/api/schools/st-marys/invitations/",
+                data={"role": Role.TEACHER.value, "email": email},
+                content_type="application/json",
+                HTTP_HOST=host,
+            )
+        self.assertEqual(response.status_code, 201, response.content)
+        return RecordingChannel.sent[-1]
+
+    def test_two_hosts_produce_the_same_origin(self):
+        first = self.invite_from("testserver", "one@example.com")
+        second = self.invite_from("admin.testserver", "two@example.com")
+
+        self.assertEqual(
+            first["accept_url"],
+            f"https://portal.example.school/invitations/{first['raw_token']}/",
+        )
+        self.assertEqual(
+            second["accept_url"],
+            f"https://portal.example.school/invitations/{second['raw_token']}/",
+        )
+        # The tokens differ; everything around them does not.
+        self.assertNotEqual(first["raw_token"], second["raw_token"])
+        self.assertEqual(
+            first["accept_url"].replace(first["raw_token"], "T"),
+            second["accept_url"].replace(second["raw_token"], "T"),
+        )
+
+    def test_the_link_carries_no_trace_of_the_request_host(self):
+        delivered = self.invite_from("admin.testserver", "three@example.com")
+        self.assertNotIn("testserver", delivered["accept_url"])
+
+    def test_the_token_in_the_delivered_link_is_one_the_api_accepts(self):
+        """The half no test covered: that the link carries a *working* token.
+
+        The accept page itself is a frontend route and cannot be asserted to
+        resolve from here. What can be asserted is the thing that page will do
+        with what it is given — read the token out of the URL and present it to
+        this API — so that a change to the template that mangled the token would
+        fail here rather than in somebody's inbox.
+        """
+        delivered = self.invite_from("testserver", "four@example.com")
+        prefix = "https://portal.example.school/invitations/"
+        self.assertTrue(delivered["accept_url"].startswith(prefix))
+        token_from_link = delivered["accept_url"][len(prefix):].rstrip("/")
+
+        self.client.logout()
+        preview = self.client.get(f"/api/invitations/{token_from_link}/")
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["school"], "St Mary's")
+
+    @override_settings(INVITATION_ACCEPT_URL=None)
+    def test_an_unconfigured_accept_url_is_a_503_that_creates_nothing(self):
+        """Not a 400: the request was fine and the platform is not set up.
+
+        And not a 500 either, which is what an uncaught misconfiguration would
+        have been. The important half is the second assertion — the refusal
+        happens before the commit, so a deploy that never sets the URL does not
+        accumulate a placeholder account per attempt.
+        """
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                "/api/schools/st-marys/invitations/",
+                data={"role": Role.TEACHER.value, "email": "nobody@example.com"},
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertFalse(User.objects.filter(email="nobody@example.com").exists())
+        self.assertEqual(RecordingChannel.sent, [])
+
+
+@override_settings(
+    INVITATION_CHANNEL="schools.delivery.EmailChannel",
+    INVITATION_ACCEPT_URL=ACCEPT_URL,
+)
+class MailFailureApiTests(TransactionTestCase):
+    """Finding #7, over HTTP: what the admin is told when mail is broken.
+
+    The two halves are deliberately different answers. A deploy with no
+    `EMAIL_HOST` is refused with nothing committed — nobody can be invited until
+    an operator fixes it. An outage *after* the commit cannot be undone and
+    should not be: the invitation exists and is resendable, so the admin is told
+    that rather than being handed a 500 and left guessing whether it worked.
+
+    `TransactionTestCase`, and that is the whole point rather than a preference.
+    The 502 depends on *where* an `on_commit` callback runs: `invite_staff()` is
+    the outermost atomic block, so its callbacks fire as that block commits —
+    inside the service call, inside the view's `try`, which is what lets `api.py`
+    catch `DeliveryFailed` and answer 502. Under `TestCase` the whole test is
+    wrapped in a transaction that never commits, so
+    `captureOnCommitCallbacks(execute=True)` runs the callbacks *after* the view
+    has already returned. Written that way this test passed a 201 and let the
+    exception escape into the test itself — proving nothing about the handler it
+    exists to cover.
+    """
+
+    def setUp(self):
+        portal = School(name="Portal", slug="portal", schema_name="public")
+        portal.auto_create_schema = False
+        portal.save()
+        Domain.objects.create(tenant=portal, domain="testserver", is_primary=True)
+
+        self.stmarys = make_school("St Mary's", "st-marys", "st_marys")
+        self.admin = User.objects.create_user(
+            "admin@st-marys.school",
+            PASSWORD,
+            full_name="Ada Admin",
+            email="admin@st-marys.school",
+        )
+        grant_membership(self.admin, self.stmarys, Role.ADMIN)
+        self.client.force_login(self.admin)
+
+    def post_invite(self, email="new.teacher@example.com"):
+        # No `captureOnCommitCallbacks` here, deliberately. These commit for
+        # real, so delivery is dispatched where it is dispatched in production:
+        # as `invite_staff()`'s atomic block exits, inside the view.
+        return self.client.post(
+            "/api/schools/st-marys/invitations/",
+            data={"role": Role.TEACHER.value, "email": email},
+            content_type="application/json",
+        )
+
+    @override_settings(
+        EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend", EMAIL_HOST=""
+    )
+    def test_no_mail_host_is_a_503_and_creates_nothing(self):
+        response = self.post_invite()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("EMAIL_HOST", response.json()["detail"])
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertEqual(Membership.objects.filter(role=Role.TEACHER).count(), 0)
+        self.assertFalse(User.objects.filter(email="new.teacher@example.com").exists())
+
+    def test_a_mail_outage_is_a_502_and_the_invitation_survives_to_be_resent(self):
+        """Committed and undeliverable is a real state, and it has an answer.
+
+        `_deliver()` dispatches through `on_commit`, so this failure arrives
+        after the rows are durable. Losing them is not an option and pretending
+        the mail went out is worse, so the admin gets a distinct code and an
+        invitation they can resend.
+        """
+        with mock.patch(
+            "schools.delivery.send_mail",
+            side_effect=ConnectionRefusedError("[Errno 111] Connection refused"),
+        ):
+            response = self.post_invite()
+
+        self.assertEqual(response.status_code, 502)
+        detail = response.json()["detail"]
+        self.assertIn("Resend", detail)
+        # The cause is logged, not handed to the caller. `SMTPAuthenticationError`
+        # carries the mail server's own response — a hostname and a credential
+        # complaint that a school admin has no business reading.
+        self.assertNotIn("Errno", detail)
+        self.assertNotIn("Connection refused", detail)
+
+        invitation = Invitation.objects.get()
+        self.assertEqual(invitation.status, InvitationStatus.PENDING)
+        self.assertEqual(invitation.membership.status, MembershipStatus.INVITED)
+
+        # And the resend works once mail does, rather than the row being stuck.
+        mail.outbox = []
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"
+        ):
+            resent = self.client.post(
+                f"/api/schools/st-marys/invitations/{invitation.pk}/resend/"
+            )
+
+        self.assertEqual(resent.status_code, 201)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("portal.example.school", mail.outbox[0].body)
+
+    def test_retrying_a_failed_invite_does_not_pile_up_placeholder_accounts(self):
+        """Why losing the row post-commit is not the emergency it looks like.
+
+        Re-inviting the same person is idempotent: the account is reused, the
+        membership is already INVITED, and `_issue()` revokes the stale token
+        before minting the next. So an admin hammering the button through an
+        outage leaves one account and one live invitation, not one per attempt.
+        """
+        with mock.patch(
+            "schools.delivery.send_mail",
+            side_effect=ConnectionRefusedError("[Errno 111] Connection refused"),
+        ):
+            for _ in range(3):
+                self.assertEqual(self.post_invite().status_code, 502)
+
+        self.assertEqual(User.objects.filter(email="new.teacher@example.com").count(), 1)
+        self.assertEqual(
+            Membership.objects.filter(
+                user__email="new.teacher@example.com", school=self.stmarys
+            ).count(),
+            1,
+        )
+        self.assertEqual(Invitation.objects.filter(status=InvitationStatus.PENDING).count(), 1)

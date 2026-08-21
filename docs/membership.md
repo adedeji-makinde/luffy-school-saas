@@ -555,12 +555,57 @@ parents is a new class beside `EmailChannel` and a settings value — not an edi
 delivered for an invitation whose transaction rolled back.
 
 That dispatch cuts both ways, which is why a channel may also answer
-`check_deliverable(invitation)`. Because `send()` runs *after* the commit, a failure
-inside it cannot undo anything — the caller saw an error while the placeholder user, the
-membership and an undeliverable invitation all survived, one more orphaned set per retry.
-The deterministic half of that failure, "there is no address to reach them at", is asked
-before the commit instead. It is optional, so a channel that cannot answer without
-sending — and a test double that is a plain object with a `send` — remains valid.
+`check_deliverable(invitation)` and `check_configured()`. Because `send()` runs *after*
+the commit, a failure inside it cannot undo anything — the caller saw an error while the
+placeholder user, the membership and an undeliverable invitation all survived, one more
+orphaned set per retry. The deterministic half of that failure is asked before the commit
+instead, and it is two questions rather than one because the answers have different
+audiences: `check_configured()` asks "can this deploy send *anything*?" (a missing
+`EMAIL_HOST` is nobody's fault but the operator's), `check_deliverable()` asks "can it
+reach *this person*?" (a teacher with no email address is something the admin can fix by
+typing one). Both are optional, so a channel that cannot answer without sending — and a
+test double that is a plain object with a `send` — remains valid.
+
+**The accept link's origin is a setting, not the request.** `INVITATION_ACCEPT_URL` is a
+template containing `{token}`, and it is the only place that decides where an invitation
+points. The two API call sites used to build it from `request.build_absolute_uri()`, which
+made the origin of a live credential a property of whichever host the *issuing admin*
+happened to be signed in on: `TenantMainMiddleware` resolves the portal host and a
+school's own host differently, so inviting the same teacher from two places produced links
+on two different origins — for a page that is meant to live on a frontend which may be on
+neither, and which no urlconf in this project serves. Nothing pinned the path either; the
+service tests used `https://portal/i/{token}/` and `api.py` emitted `/invitations/{token}/`.
+
+The setting has **no default**, which is deliberate: a hard-coded origin is wrong for
+every deploy but one, and falling back to the request host is the bug being removed. An
+unset or placeholder-less value is refused by `invitations.configured_accept_url()`, and
+refused *before the commit*, so a deploy that has not been set up creates no orphaned
+placeholder accounts on the way to saying so.
+
+Note what this does **not** decide: whether Django should eventually serve the accept page
+itself. It stays a frontend route, and the setting is what makes that choice reversible —
+pointing it at a Django-served path later is a settings change and a urlconf entry, not an
+edit to the flow.
+
+**A mail deploy fails in two different ways and gets two different answers.** SMTP is the
+`EMAIL_BACKEND` default, but Django's own SMTP defaults are `localhost:25` with no
+credentials — not a mail server on any host this runs on — so a deploy that configured
+nothing raised `ConnectionRefusedError` from inside an `on_commit` callback, after
+everything had committed, and reached the admin as an unexplained 500.
+
+- **No `EMAIL_HOST` at all** is a misconfiguration: `EmailChannel.check_configured()`
+  refuses pre-commit and the API answers **503**, with nothing left behind. Nobody can be
+  invited until an operator sets one, and that is what the response says.
+- **An outage** — host set, connection refused or timed out — is caught in `send()` and
+  re-raised as `DeliveryFailed`, which the API answers **502**. This one is post-commit
+  and stays that way: the invitation exists, and losing it would be worse than keeping it.
+  Re-inviting is idempotent (the account is reused, the membership is already `INVITED`,
+  and minting revokes the stale token), so retrying through an outage leaves one account
+  and one live invitation rather than one per attempt.
+
+The `except` around the send is `(OSError, SMTPException)` and not `Exception`, on purpose:
+folding a `TypeError` in the body template into "the mail server is down" would turn a bug
+report into an outage nobody could reproduce.
 
 **`EMAIL_BACKEND` must not default to the console backend.** It once did, and that failed
 open in both directions: nothing was delivered, nothing raised, and the whole message —
