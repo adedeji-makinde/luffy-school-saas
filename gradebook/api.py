@@ -39,10 +39,10 @@ from django.db.models import Count, Sum
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from ninja import Router, Schema
-from ninja.security import django_auth
 
 from accounts.models import Membership, Role
 from accounts.services import school_directory
+from accounts.session import session_auth
 
 from . import services
 from .models import Assessment, Score
@@ -52,7 +52,7 @@ from .models import Assessment, Score
 #: out per endpoint because the anonymous ones are the surprising case. Nothing
 #: here is ever anonymous, so the default belongs in one place where a fourth
 #: endpoint added later inherits it instead of having to remember it.
-router = Router(auth=django_auth)
+router = Router(auth=session_auth)
 
 
 # -- response and request shapes ---------------------------------------------

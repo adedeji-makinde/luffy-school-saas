@@ -32,10 +32,10 @@ from typing import Optional
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from ninja import NinjaAPI, Schema
-from ninja.errors import HttpError
-from ninja.security import django_auth
+from ninja.errors import AuthenticationError, HttpError
 
 from accounts.services import NotPermitted
+from accounts.session import SESSION_EXPIRED, session_auth, why_unauthenticated
 from gradebook.api import router as gradebook_router
 from schools import invitations as invitation_service
 from schools.delivery import NoDeliveryAddress
@@ -51,6 +51,54 @@ from schools.models import (
 api = NinjaAPI(title="Luffy School API", version="1.0.0")
 
 api.add_router("/gradebook/", gradebook_router, tags=["gradebook"])
+
+
+@api.exception_handler(AuthenticationError)
+def unauthenticated(request, exc):
+    """A 401 that says which 401 it is.
+
+    ninja's stock answer is `{"detail": "Unauthorized"}` whether the caller never
+    signed in or signed in and has since been timed out. Those are the same
+    status code and completely different situations, and the difference is the
+    whole of this item: a teacher part-way through a marking sheet whose session
+    lapses has work in the browser that is still perfectly good, and a client
+    that cannot tell a lapsed session from a missing one has to treat every 401
+    as fatal and drop it.
+
+    `code` is what a client branches on; `detail` is for a person. Both are the
+    caller's own situation — whether the browser sent a session cookie — so this
+    discloses nothing about anybody else, unlike the deliberately flat 404s the
+    invitation routes answer a bad token with.
+
+    `retryable` is stated rather than left to be inferred from `code`, because
+    it is the thing a client most needs to know and it rests on a premise worth
+    saying out loud: authentication runs *before* the view, so a request that
+    came back 401 did not happen. Not "probably did not" — the operation was
+    never entered. Sending it again after signing in therefore applies it once,
+    not twice, and that holds for every endpoint here rather than only the
+    idempotent ones.
+
+    It is a narrower claim than "this request is safe to repeat in general". A
+    write whose *response* was lost is a different situation, indistinguishable
+    from this one at the browser and genuinely at risk of being applied twice.
+    What covers that is the gradebook's own version check, not this flag — see
+    `gradebook.api._is_our_write_arriving_twice()`.
+    """
+    expired = why_unauthenticated(request) == SESSION_EXPIRED
+    return api.create_response(
+        request,
+        {
+            "detail": (
+                "Your session has ended. Sign in again — anything you were "
+                "part-way through can be sent again once you have."
+                if expired
+                else "Sign in to use this endpoint."
+            ),
+            "code": why_unauthenticated(request),
+            "retryable": expired,
+        },
+        status=401,
+    )
 
 
 # -- request and response shapes ---------------------------------------------
@@ -137,7 +185,7 @@ class AcceptedOut(Schema):
 @api.post(
     "/schools/{slug}/invitations/",
     response={201: InvitationOut},
-    auth=django_auth,
+    auth=session_auth,
     tags=["invitations"],
 )
 def create_invitation(request, slug: str, payload: InviteIn):
@@ -177,7 +225,7 @@ def create_invitation(request, slug: str, payload: InviteIn):
 @api.post(
     "/schools/{slug}/invitations/{invitation_id}/resend/",
     response={201: InvitationOut},
-    auth=django_auth,
+    auth=session_auth,
     tags=["invitations"],
 )
 def resend_invitation(request, slug: str, invitation_id: int):
@@ -221,7 +269,7 @@ def resend_invitation(request, slug: str, invitation_id: int):
 @api.post(
     "/schools/{slug}/invitations/{invitation_id}/revoke/",
     response=InvitationOut,
-    auth=django_auth,
+    auth=session_auth,
     tags=["invitations"],
 )
 def revoke_invitation(request, slug: str, invitation_id: int):

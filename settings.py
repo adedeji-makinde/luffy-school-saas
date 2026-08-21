@@ -83,6 +83,41 @@ AUTH_PASSWORD_VALIDATORS = [
 # reach for different identifiers, so accept any of username / email / phone.
 AUTHENTICATION_BACKENDS = ["accounts.backends.IdentifierBackend"]
 
+# ---------------------------------------------------------------------------
+# Sessions
+#
+# Both settings below are Django defaults being overridden deliberately, so both
+# say why. The case that decides them is a teacher marking a class of thirty:
+# each cell saves as it loses focus, so a marking session is a long stretch of
+# steady small writes rather than one form and one submit.
+#
+# **The window is idle time, not total time.** Django's default,
+# `SESSION_SAVE_EVERY_REQUEST = False`, runs the clock from the moment of login
+# and never extends it however hard the person is working. A teacher who signed
+# in near the end of the window gets logged out mid-sheet, cursor still in a
+# cell, having saved marks successfully seconds earlier. Sliding the expiry on
+# every request is what makes "expired" mean "went away", which is the only
+# meaning anybody expects.
+#
+# The cost is a session write per request, and with one request per blur that is
+# thirty writes for one register rather than none. Accepted: the row is small and
+# keyed by primary key, and the alternative is losing a teacher's work. If it
+# ever shows up in the database's load, the fix is a cached session backend, not
+# turning this back off.
+#
+# **Twelve hours, down from Django's two weeks.** A school day plus room either
+# side, so a normal working day never trips it and a session left open on a
+# shared staff-room computer is gone by the next morning. Two weeks of *idle*
+# time on a machine several teachers use is a long time to leave a signed-in
+# gradebook lying around; two weeks of idle time was never the intent, it was
+# simply the default nobody had chosen.
+#
+# Not `SESSION_EXPIRE_AT_BROWSER_CLOSE`: half of marking is done in a browser
+# that is never deliberately closed, and it would put the teacher back where this
+# started — logged out at a moment they did not choose.
+SESSION_SAVE_EVERY_REQUEST = True
+SESSION_COOKIE_AGE = 60 * 60 * 12
+
 # Parsing default only, not a restriction: a number typed with no country
 # code is read as Nigerian, but any other country's numbers are still valid.
 # See accounts/identifiers.py.

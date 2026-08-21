@@ -300,6 +300,62 @@ indexes don't collide. Students get a school-issued handle (`STM/2026/0042`) bec
 many have no email address; parents commonly use the phone number the school has on
 file.
 
+## Staying signed in, and being told when you are not
+
+The case that decides session policy is a teacher marking a class of thirty. Each cell
+saves as it loses focus, so a marking session is a long stretch of small writes, not one
+form and one submit. Two Django defaults are wrong for that shape, and both are overridden
+in `settings.py` with the reasoning kept beside them.
+
+**The window is idle time, not total time.** Django's default
+(`SESSION_SAVE_EVERY_REQUEST = False`) runs the clock from the moment of *login* and never
+extends it, however hard the person is working. A teacher who signed in near the end of
+the window is logged out mid-sheet with the cursor still in a cell, seconds after saving a
+mark successfully. `SESSION_SAVE_EVERY_REQUEST = True` slides the expiry on every request,
+so "expired" means "went away" — the only thing anybody expects it to mean. The cost is
+one session write per request, which for a register is thirty rather than none; accepted,
+and if it ever shows in database load the answer is a cached session backend, not turning
+it back off.
+
+`SESSION_COOKIE_AGE` is twelve hours, down from Django's two weeks. A school day with room
+either side, so a normal working day never trips it and a session left open on a shared
+staff-room computer is gone by morning. Two weeks of *idle* time was never a decision; it
+was the default nobody had chosen.
+
+**A 401 says which 401 it is.** ninja's stock answer is `{"detail": "Unauthorized"}`
+whether the caller never signed in or signed in and has since been timed out. Those are
+the same status code and completely different situations: the second means *your work is
+still good, sign in again and send it*, and a client that cannot tell them apart has to
+treat every 401 as fatal and discard whatever the teacher had typed.
+`accounts.session.SchoolSessionAuth` stamps which case it is — a session cookie was
+presented, or none was — and the handler in `api.py` turns that into `code`
+(`session_expired` / `not_authenticated`), `detail` for a person, and `retryable`.
+
+`retryable` rests on a premise worth stating: authentication runs *before* the view, so a
+request answered with 401 did not happen. Sending it again after signing in applies it
+once, not twice, on every endpoint rather than only the idempotent ones. It is a narrower
+claim than "safe to repeat in general" — a write whose *response* was lost is a different
+situation and is covered by the gradebook's version check, not by this flag.
+
+Splitting one 401 into two is the kind of change that quietly becomes a disclosure, so:
+this one is not a session-key oracle. A forged or random cookie is unusable for exactly
+the same reason an expired one is and gets exactly the same answer. Nothing reports
+whether the key was ever real — unlike the invitation routes, which must answer a bad
+token with a flat 404 because there *is* something on the other side to leak.
+
+**What the server deliberately does not do is hold the teacher's unsent marks.** Writing
+them would need the authority that just lapsed, and a server-side draft store is a second
+copy of the gradebook with none of its rules. Replaying is the client's job, and the
+server's half of the bargain is that replaying is *safe*: every write is conditional on
+the version the teacher was shown, and a repeat of the caller's own write is recognised
+rather than counted twice. `gradebook/tests/test_session_expiry.py` holds that across a
+re-login, which is the one place it could quietly stop being true — the retry is the same
+person on a different session.
+
+> **There is no login endpoint yet**, which caps how far this can go: a client can be told
+> its session lapsed but has nowhere to send credentials except the Django admin form. See
+> [Open items](#open-items).
+
 ## Identifiers: one phone number, one account
 
 Before this, `phone` was stored as whatever string was typed. `08031234567`
@@ -408,6 +464,20 @@ What remains open is the other half of the audience: parents and students. That 
 the same flow with a different role value. Parents commonly share one phone between two
 guardians, students often have neither email nor phone, and both need a channel that is
 not email — which is why delivery is a seam rather than a method (see below).
+
+**3. There is no login endpoint.** `IdentifierBackend` resolves username, email or phone
+to a user, and `Invitation.accept()` sets a first password — but nothing in `api.py`
+exchanges credentials for a session. Tests use `force_login()`; the only real sign-in form
+on the platform is Django admin's.
+
+This became load-bearing with [Staying signed in](#staying-signed-in-and-being-told-when-you-are-not).
+The API can now tell a client that its session lapsed and that the refused request is safe
+to send again, which is most of what "handle session expiry" means — but the client has
+nowhere to sign in, so it cannot complete the recovery. The remaining half is small in
+code and not small in decisions: rate limiting and lockout, whether sign-in happens on the
+portal host or a school's own host, and whether a session is scoped to one school or
+follows a person across every school they belong to. Deferred deliberately rather than
+guessed at in passing, on the same reasoning as the two decisions in issue #6.
 
 ## Inviting staff
 
