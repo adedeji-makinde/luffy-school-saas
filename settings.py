@@ -33,9 +33,14 @@ SHARED_APPS = [
 
 TENANT_APPS = [
     # Each school gets its own copy of these tables, in its own schema.
-    # Attendance, fees and report cards land here alongside academics.
+    # Attendance and report cards land here alongside these two.
     "django.contrib.contenttypes",
     "academics",
+    # A school's own books. Separate from `academics` rather than a module
+    # inside it because the two answer to different people and change on
+    # different schedules — a bursar's ledger and a calendar of terms share only
+    # the fact that both belong to one school.
+    "fees",
 ]
 
 INSTALLED_APPS = SHARED_APPS + [app for app in TENANT_APPS if app not in SHARED_APPS]
