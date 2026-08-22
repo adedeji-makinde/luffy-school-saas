@@ -301,11 +301,14 @@ an import with no person behind it, and naming a fictional one is worse.
 
 ## Not built
 
-- **No class or stream model.** An `Assessment` belongs to a (term, subject) and
-  not to a class, because there is no class model in this project yet and
-  inventing one here would be guessing at how a school groups its children. Who
-  was scored is answered by which students have a `Score`, which is enough for a
-  sheet and a total.
+- **An `Assessment` still belongs to a (term, subject), not to a class.** There
+  *is* a class model now — `academics.ClassGroup` and `ClassPlacement`, see
+  [classes.md](classes.md) — built because a position in class and a class
+  average have no denominator without a roster. Linking assessments to it is a
+  separate question that nothing has needed yet, and adding it speculatively
+  would be the same guess this app declined to make. Who was scored is still
+  answered by which students have a `Score`, which remains enough for a sheet
+  and a total.
 - **No grading scale and no report card.** Turning 17/20 into a "B", weighting CA
   against exam, and printing a term's results are each their own decision with
   their own arguments. The three numbers this app returns are what those would be

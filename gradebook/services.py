@@ -33,11 +33,12 @@ lives in a view only holds for the view. `gradebook/api.py` is a caller of this
 module, not a second place the rules are written.
 """
 
-from django.db import IntegrityError, connection, transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
 from accounts.models import Role
+from accounts.students import why_not_a_student_here
 
 from .models import Score
 
@@ -112,26 +113,15 @@ ANY_VERSION = _AnyVersion()
 def _require_student_of_this_school(membership):
     """Refuse a membership that is not a student here, before anything is written.
 
-    "Here" is the schema the connection is on, which is the school whose marks
-    are about to be written. Read from the connection rather than passed in, for
-    the reason `fees.services` reads it there: the table being written is
-    already chosen by the `search_path`, so a second opinion in an argument
-    could disagree with it and the row would land in one school's book having
-    been checked against another's.
+    The rule itself now lives in `accounts.students`, which is where the
+    docstring on `NotThisSchoolsStudent` above said it would go once a third
+    tenant app needed it. `academics.ClassPlacement` was the third. What stays
+    here is the *raising*: a caller catching `GradebookError` must still catch
+    this, which it would not if the shared module raised a type of its own.
     """
-    if membership.role != Role.STUDENT:
-        raise NotThisSchoolsStudent(
-            f"{membership} is not a student membership. A score is keyed on a "
-            f"student's STUDENT membership, which is what pins both the child "
-            f"and their school."
-        )
-
-    if membership.school.schema_name != connection.schema_name:
-        raise NotThisSchoolsStudent(
-            f"{membership.user} is a student at {membership.school}, and this is "
-            f"another school's gradebook. A mark belongs to the school that "
-            f"taught and set the assessment."
-        )
+    reason = why_not_a_student_here(membership, subject="a mark", holder="gradebook")
+    if reason:
+        raise NotThisSchoolsStudent(reason)
     return membership
 
 

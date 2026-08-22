@@ -7,11 +7,17 @@ exactly one school and is not merely hidden from the others — it is in a
 different Postgres schema and therefore not on their connection's
 `search_path` at all. See docs/tenancy.md.
 
-Deliberately holds **no foreign keys**, including none back to `accounts`.
-That is not an oversight: a tenant→shared foreign key is an unresolved
-design question with a real failure mode, and it is a hard blocker on the
-next tenant model rather than something to settle in passing. docs/tenancy.md
-records what was measured and what has to be decided first.
+Holds **no foreign key into `accounts`**, and never will. That is not an
+oversight: `on_delete` is resolved against whichever schema the connection is
+on, so a tenant→shared key gives `PROTECT` that does not protect and `CASCADE`
+that cascades one school's rows only. docs/tenancy.md records what was measured.
+
+`Term` originally held no foreign keys *at all*, which was true of it because
+it pointed at nothing. `ClassPlacement` below points at two things and settles
+the question the way `fees.FeeLedgerEntry` and `gradebook.Score` already had:
+**real foreign keys between tables in the same schema, a bare id across the
+schema boundary**, with the check that earns the bare id made in
+`academics.services` before anything is written.
 """
 
 from django.db import models
@@ -163,3 +169,141 @@ class Term(models.Model):
         is a different thing from what the school actually taught.
         """
         return (self.ends_on - self.starts_on).days + 1
+
+
+class ClassGroup(models.Model):
+    """One teaching group a school puts children in: "JSS 1A", "Primary 4".
+
+    `gradebook.Assessment` refused to name one of these, and said why: there was
+    no class model, and inventing one there would have been guessing at how a
+    school groups its children. It is no longer a guess — a position in class
+    and a class average are the two numbers a report card is judged on, and
+    neither has a denominator without this table.
+
+    Deliberately *not* tied to a session or a term. "JSS 1A" is the same group
+    year after year; who sits in it is what changes, and that is
+    `ClassPlacement`. Putting a session on the group instead would mean a new
+    row per year, and every historical placement pointing at a different one —
+    so "how did JSS 1A do last year" would have to be asked of a different
+    class, which is not what anybody means by the question.
+    """
+
+    #: What the school prints. Its own name rather than a level plus an arm,
+    #: because schools spell it their own way — "JSS 1A", "Primary 4 Gold",
+    #: "Year 7 Blue" — and a composed one would fight them, exactly as
+    #: `Subject.code` is stored rather than slugged from `Subject.name`.
+    name = models.CharField(max_length=64)
+
+    #: Where the group sits in the school's own order, smallest first. Not
+    #: derived from `name`: "JSS 1A" sorts before "JSS 10A" as text, and no
+    #: string rule survives a school that runs Nursery, Primary and Senior in
+    #: one place. Used for ordering a broadsheet and, later, for what promotion
+    #: means. Not unique — a year with three arms has three groups at one level.
+    level = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="The school's own ordering, smallest first. Arms of one year share a level.",
+    )
+
+    is_active = models.BooleanField(
+        default=True,
+        help_text="A group no longer taught. Kept, because old placements name it.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["level", "name"]
+        constraints = [
+            # Per schema, so St Mary's having a "JSS 1A" does not stop Grace
+            # Academy having one. Same isolation as `uniq_term_session_name`.
+            models.UniqueConstraint(fields=["name"], name="uniq_class_group_name"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class ClassPlacementQuerySet(models.QuerySet):
+    def for_term(self, term):
+        return self.filter(term=term)
+
+    def roster(self, class_group, term):
+        """Who sat in this group this term."""
+        return self.filter(class_group=class_group, term=term)
+
+    def student_ids(self, class_group, term) -> list[int]:
+        return list(
+            self.roster(class_group, term).values_list(
+                "student_membership_id", flat=True
+            )
+        )
+
+
+class ClassPlacement(models.Model):
+    """Which group one child sat in for one term.
+
+    **Per term, not per session**, and that is the decision this table turns on.
+    Everything a report card is reckoned from is already per term — attendance,
+    fees, assessments — and a child who moves from JSS 1A to JSS 1B in January
+    must be ranked in the group they were actually taught in, not the one they
+    started the year in. A session-scoped placement would have to be edited to
+    describe that, which would silently rewrite the position printed on a
+    report card that had already gone home.
+
+    Named `ClassPlacement` rather than `Enrolment` on purpose.
+    `accounts.services.enroll_student()` already means something else — becoming
+    a student of the school at all — and two words one letter apart, meaning
+    two different things, is how the wrong one gets called.
+    """
+
+    # Both tenant-local, so both are real foreign keys with real integrity. The
+    # cross-schema problem docs/tenancy.md describes does not arise between two
+    # tables in one schema — the same note `gradebook.Assessment` carries.
+    class_group = models.ForeignKey(
+        ClassGroup, related_name="placements", on_delete=models.PROTECT
+    )
+    term = models.ForeignKey(
+        Term, related_name="placements", on_delete=models.PROTECT
+    )
+
+    # A bare id, not a ForeignKey, pointing at the child's STUDENT membership in
+    # the shared `accounts` app — the policy settled in docs/tenancy.md and
+    # applied by `fees.FeeLedgerEntry` and `gradebook.Score` before this.
+    # `academics.services` checks the id names a student *of this school* before
+    # anything is written; see `accounts.students.why_not_a_student_here()`,
+    # which this table is the third caller of and the reason it exists.
+    student_membership_id = models.PositiveBigIntegerField(db_index=True)
+
+    placed_by_id = models.PositiveBigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ClassPlacementQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["class_group", "student_membership_id"]
+        indexes = [
+            # The roster query, which every position and every class average
+            # runs: "who was in this group this term".
+            models.Index(fields=["class_group", "term"]),
+        ]
+        constraints = [
+            # **One group per child per term**, and this is the load-bearing
+            # line in the file. Without it a child can sit in two groups at
+            # once, which does not read as corrupt anywhere — it reads as two
+            # perfectly ordinary rows — and produces two positions in class and
+            # two class averages for one term, with nothing to say which is the
+            # one to print.
+            #
+            # It is also the backstop for the race: two administrators placing
+            # the same child into different arms at the same instant both find
+            # no row and both insert. `services.place_student()` turns the
+            # resulting IntegrityError into a refusal naming the group that won.
+            models.UniqueConstraint(
+                fields=["term", "student_membership_id"],
+                name="one_class_placement_per_student_per_term",
+            ),
+        ]
+
+    def __str__(self):
+        return f"membership {self.student_membership_id} in {self.class_group} ({self.term})"
