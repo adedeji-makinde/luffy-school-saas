@@ -103,6 +103,31 @@ a fresh pass.
   approved may also release. Approving and checking are the two that must be
   different people.
 
+### `cycle` has exactly one source
+
+The invariant, stated plainly because both database guards depend on it:
+
+> **`cycle` is read off the row `_move()` locked, never off the instance the
+> caller passed in, and only `send_back()` increments it.**
+
+No transition function accepts a `cycle=` argument, and a test asserts that
+structurally — one added in a hurry would silently unscope both guards, and
+nothing else in the suite would notice.
+
+The failure it prevents is ordinary, not exotic. A screen loads a sheet,
+somebody else sends it back, and the screen then submits using the instance it
+is still holding — whose `cycle` says 0. Stamped from that instance, the
+resubmission is written into a bucket the guards have already used. Changing one
+line to `cycle=sheet.cycle` and re-running gives:
+
+    IntegrityError: duplicate key value violates unique constraint
+    "one_signature_per_person_per_review_cycle"
+    DETAIL: Key (sheet_id, cycle, actor_id)=(1, 0, 1) already exists.
+
+— the teacher colliding with their own earlier submission at cycle 0. The
+visible symptom is a crash; the invisible one, had the collision not existed,
+would have been a second approval at the wrong cycle that no guard fires on.
+
 ## What the lock actually buys
 
 `approve()` is read-modify-write on one row, and every transition takes
@@ -168,6 +193,44 @@ It slots into `STAFF_ROLES` with no special-casing: `invite_staff()`,
 `get_role_display()` all pick it up from there. `sqlmigrate` confirms the
 choices migration is a no-op — no rewrite of the shared `accounts_membership`
 table.
+
+## Two control experiments, and what each proved
+
+Both are recorded here rather than only in a commit message, because the thing
+they establish is *which layer does which job* — and that is the sort of claim a
+docstring drifts away from silently.
+
+The method both times: break one thing deliberately, re-run, read the failure.
+
+| Broken | Result | What it proved |
+| --- | --- | --- |
+| `select_for_update()` removed | `one_transition_to_each_state_per_cycle` fires; the audit still holds one approval | The **constraint** prevents the double approval. The **lock** only converts the loser's 500 into a `WrongState`. The lock's docstring had been claiming the constraint's work. |
+| `cycle=locked.cycle` → `cycle=sheet.cycle` | `one_signature_per_person_per_review_cycle` fires on a resubmission | `cycle` really is load-bearing, and taking it from the locked row is what keeps it correct. |
+
+The first is the one worth remembering. It would have been entirely natural to
+write "the lock prevents two approvals", ship it, and have a true-sounding
+sentence in the codebase that no longer described the code the day somebody
+removed the constraint as redundant.
+
+## A test-isolation trap this app walked into
+
+`TransactionTestCase` flushes the *public* tables between tests. A tenant schema
+is not a table and survives — so the next `School.save()` finds the schema
+already there, skips `CREATE SCHEMA`, and inherits the previous test's rows.
+
+`academics.tests.test_classes.PlacementUnderConcurrencyTests` did that, passing
+alone and within its own app, and left an `st_marys` holding a `Term`.
+`results.tests.test_approval_concurrency` then failed three tests in its own
+`setUp` with `uniq_term_session_name` — a failure that reads like a bug in the
+victim and belongs entirely to the leaker.
+
+Both now drop the schema in `tearDown`, with SQL rather than
+`School.delete(force_drop=True)`: `Membership.school` is `PROTECT`, so deleting
+the row is refused while the test's memberships point at it. The row is flushed
+for us; the schema is the part that has to be told to go.
+
+Plain `TestCase` needs none of this — its rollback covers tenant tables too,
+because they are in the same transaction.
 
 ## Not built here
 
