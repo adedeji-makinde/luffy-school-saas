@@ -14,10 +14,10 @@ call, and keeping the rules here rather than in a view is what makes them true
 for an import and a management command too.
 """
 
-from django.db import connection, transaction
+from django.db import transaction
 from django.utils import timezone
 
-from accounts.models import Role
+from accounts.students import why_not_a_student_here
 
 from .models import FeeEntryKind, FeeLedgerEntry, LedgerIsAppendOnly
 
@@ -70,27 +70,16 @@ class NotThisSchoolsStudent(FeeLedgerError):
 def _require_student_of_this_school(membership):
     """Refuse a membership that is not a student here, before anything is written.
 
-    "Here" is the schema the connection is currently on, which is the school
-    whose books are about to be written. Reading it from the connection rather
-    than from an argument is deliberate: the ledger table being written is
-    *already* chosen by the search_path, so any second opinion passed in could
-    disagree with it, and the row would land in one school's books while having
-    been checked against another's.
+    The rule itself now lives in `accounts.students` — see the note on
+    `NotThisSchoolsStudent` above, which said it would move there once a third
+    tenant app asked the same question. What stays here is the *raising*, so
+    that `except FeeLedgerError` still means "the entry was not posted".
     """
-    if membership.role != Role.STUDENT:
-        raise NotThisSchoolsStudent(
-            f"{membership} is not a student membership. The ledger is keyed on a "
-            f"student's STUDENT membership, which is what pins both the child "
-            f"and their school."
-        )
-
-    schema = connection.schema_name
-    if membership.school.schema_name != schema:
-        raise NotThisSchoolsStudent(
-            f"{membership.user} is a student at {membership.school}, and these "
-            f"are another school's books. A fee entry belongs to the school that "
-            f"raised it."
-        )
+    reason = why_not_a_student_here(
+        membership, subject="a fee entry", holder="books"
+    )
+    if reason:
+        raise NotThisSchoolsStudent(reason)
     return membership
 
 
