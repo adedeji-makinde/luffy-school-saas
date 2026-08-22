@@ -20,6 +20,7 @@ from accounts.models import (
     Relationship,
     Role,
     User,
+    is_staff_role,
 )
 from schools.models import School
 
@@ -57,7 +58,13 @@ class EveryRoleGetsALoginTests(TestCase):
     def setUp(self):
         self.school = make_school("St Mary's", "st-marys", "st_marys")
 
-    def test_all_six_roles_can_sign_in_and_are_scoped_to_the_school(self):
+    def test_every_role_can_sign_in_and_is_scoped_to_the_school(self):
+        """Named for the property, not for a count.
+
+        The body always iterated `Role`, so it covered a seventh role the day
+        one was added — but the *name* said six, and a name that has to be
+        edited alongside the enum is a name that will one day disagree with it.
+        """
         for role in Role:
             with self.subTest(role=role.value):
                 user = make_user(f"user-{role.value}", f"Person {role.value}")
@@ -70,8 +77,55 @@ class EveryRoleGetsALoginTests(TestCase):
                 self.assertEqual(user.roles_at(self.school), {role.value})
 
     def test_roles_cover_staff_and_family_with_nothing_left_over(self):
+        """Every role is classified, and no role is classified twice.
+
+        `assertEqual(len(Role.values), 6)` used to stand here as a tripwire, and
+        it was dropped rather than bumped to 7 when the vice principal arrived.
+        A hardcoded count only says *how many* roles exist, which nothing
+        depends on; the two assertions below say the thing that is actually
+        load-bearing, and they keep saying it however many roles there are.
+
+        The exhaustiveness half is what makes a new role impossible to add
+        without deciding what it is: `Membership.staff()`, `active_staff()` and
+        `invite_staff()` all read `STAFF_ROLES`, so a role left out of both sets
+        is invisible to every staff query while still being grantable.
+
+        The disjointness half is new. The union test alone would pass with a
+        role in *both* sets, and `is_staff_role()`/`is_family_role()` would then
+        both answer true for it — which nothing in the codebase is written to
+        expect.
+        """
         self.assertEqual(STAFF_ROLES | FAMILY_ROLES, set(Role.values))
-        self.assertEqual(len(Role.values), 6)
+        self.assertEqual(STAFF_ROLES & FAMILY_ROLES, set())
+
+    def test_the_vice_principal_is_classified_as_staff(self):
+        """Stated outright, because the partition test passes either way.
+
+        A role added to `FAMILY_ROLES` by mistake would satisfy both assertions
+        above — the partition would still be exhaustive and still disjoint — and
+        would then be a member of staff that no staff query returns and no
+        invitation can create.
+        """
+        self.assertIn(Role.VICE_PRINCIPAL_ACADEMIC, STAFF_ROLES)
+        self.assertNotIn(Role.VICE_PRINCIPAL_ACADEMIC, FAMILY_ROLES)
+        self.assertTrue(is_staff_role(Role.VICE_PRINCIPAL_ACADEMIC))
+
+    def test_every_roles_stored_value_fits_the_column(self):
+        """`Membership.role` is `max_length=16`, and nothing checks that at import.
+
+        A value too long is not refused when the enum is defined — it is
+        truncated or rejected at the first write, per school, in production.
+        `VICE_PRINCIPAL_ACADEMIC` is why this exists (the member name is 23
+        characters, so the stored value is `vp_academic`), but it is asserted
+        over the whole enum rather than that one member. A test naming one
+        member covers the role that already went in and not the next one, which
+        is the shape the sibling test above moved away from when it dropped its
+        hardcoded count.
+        """
+        max_length = Membership._meta.get_field("role").max_length
+        for role in Role:
+            with self.subTest(role=role.name):
+                self.assertLessEqual(len(role.value), max_length)
 
     def test_no_role_confers_platform_staff(self):
         principal = make_user("head", "Head Teacher")

@@ -30,6 +30,15 @@ class Role(models.TextChoices):
 
     ADMIN = "admin", "School administrator"
     PRINCIPAL = "principal", "Principal"
+    #: The academic checker between the class teacher and the principal in the
+    #: results approval chain. Named for the scope that exists: the chain runs
+    #: per (class, term) and carries no subject, so a head of department — who
+    #: is head *of a subject area* — would have nothing here to be head of.
+    #:
+    #: The stored value is short because `Membership.role` is `max_length=16`
+    #: and "vice_principal_academic" is 23 characters. The value is an internal
+    #: key like "admin" and "bursar"; the label is what anybody actually reads.
+    VICE_PRINCIPAL_ACADEMIC = "vp_academic", "Vice Principal (Academic)"
     TEACHER = "teacher", "Teacher"
     BURSAR = "bursar", "Bursar"
     PARENT = "parent", "Parent or guardian"
@@ -42,7 +51,13 @@ class Role(models.TextChoices):
 # and compares by value. (A plain enum.Enum would hash by name and silently
 # fail set membership here.)
 STAFF_ROLES = frozenset(
-    {Role.ADMIN.value, Role.PRINCIPAL.value, Role.TEACHER.value, Role.BURSAR.value}
+    {
+        Role.ADMIN.value,
+        Role.PRINCIPAL.value,
+        Role.VICE_PRINCIPAL_ACADEMIC.value,
+        Role.TEACHER.value,
+        Role.BURSAR.value,
+    }
 )
 FAMILY_ROLES = frozenset({Role.PARENT.value, Role.STUDENT.value})
 # Every role except STUDENT may be held at several schools at once.

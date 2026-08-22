@@ -630,6 +630,26 @@ class PlacementUnderConcurrencyTests(TransactionTestCase):
 
     def tearDown(self):
         connection.set_schema_to_public()
+        # Drop the schema, not just the rows, and this is not tidiness.
+        #
+        # `TransactionTestCase` flushes the *public* tables between tests, which
+        # removes the `School` row — but a tenant schema is not a table and
+        # survives it. The next `School.save()` then finds `st_marys` already
+        # there, skips `CREATE SCHEMA`, and inherits this test's `Term` and
+        # `ClassGroup` rows.
+        #
+        # That made the suite order-dependent: this class passed alone and in
+        # `academics`, and left behind a schema that broke
+        # `results.tests.test_approval_concurrency` three tests later with a
+        # `uniq_term_session_name` violation in *its* `setUp` — a failure that
+        # reads like a bug in the victim and belongs to the leaker.
+        #
+        # Dropped with SQL rather than `School.delete(force_drop=True)`, which
+        # cannot run here: `Membership.school` is PROTECT and this test's
+        # student membership points at it. The row is flushed for us; the schema
+        # is the part that has to be told to go.
+        with connection.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{self.school.schema_name}" CASCADE')
         super().tearDown()
 
     def test_exactly_one_placement_survives_and_the_loser_is_told(self):

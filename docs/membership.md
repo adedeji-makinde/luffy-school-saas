@@ -20,9 +20,17 @@ anything in here.
 
 ## Everyone gets an account
 
-Six roles, none of them privileged in the schema: `admin`, `principal`, `teacher`,
-`bursar`, `parent`, `student`. There is no flat "staff" flag on a person. Role is an
-attribute of the *relationship* between a person and a school:
+Roles, none of them privileged in the schema: `admin`, `principal`, `vp_academic`,
+`teacher`, `bursar`, `parent`, `student`. `accounts.Role` is the list that counts —
+this one is a reader's summary and the count is deliberately not written down, for
+the reason `test_every_role_can_sign_in_and_is_scoped_to_the_school` dropped its
+own hardcoded six: a number repeated beside the enum is a number that one day
+disagrees with it. `vp_academic` is the newest, added for the results approval
+chain; its stored value is truncated because `Membership.role` is `max_length=16`,
+and `docs/results.md` says why it is a vice principal rather than an HOD.
+
+There is no flat "staff" flag on a person. Role is an attribute of the
+*relationship* between a person and a school:
 
 ```
 Membership(user, school, role, status)
