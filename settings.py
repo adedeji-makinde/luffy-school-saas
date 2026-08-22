@@ -94,6 +94,14 @@ TENANT_APPS = [
     # bursar's ledger have different readers and different release schedules,
     # and neither should have to migrate because the other changed.
     "gradebook",
+    # What a school *publishes*: the approval chain a term's results go
+    # through, and the snapshot frozen when they are released. Separate from
+    # `gradebook` for the reason `gradebook` is separate from `fees` — a
+    # teacher's working sheet is edited daily by the person who owns it, while
+    # a released result is read by parents years later and may not change at
+    # all. Two tables with opposite relationships to time do not belong in one
+    # app.
+    "results",
 ]
 
 INSTALLED_APPS = SHARED_APPS + [app for app in TENANT_APPS if app not in SHARED_APPS]
