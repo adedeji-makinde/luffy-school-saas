@@ -30,12 +30,26 @@ session that never touch the model.
                                                                    ▼
                                                               released ✱
 
-`released` is terminal, and that is a constraint rather than a convention —
-`nothing_moves_out_of_released` refuses any row whose `from_state` is
-`released`. A released result is one a parent is holding; correcting it is a
-*revision*, which makes a new version and leaves this one standing, and that is
-built separately. Without the constraint, "released is final" would be a
-sentence in a docstring that one `.update()` disagrees with.
+`released` is terminal, and that is enforced rather than conventional. It takes
+**two** guards, on two tables, and it is worth saying why one is not enough:
+
+- `nothing_moves_out_of_released` is a check constraint on the *log*, refusing
+  any transition row whose `from_state` is `released`.
+- the trigger in migration 0003 is on the *sheet*, refusing an UPDATE that moves
+  `state` off `released`.
+
+The first alone was the original design, and it does not hold the rule. It stops
+a reversal being *recorded*; it does nothing to stop one being *performed*.
+`ResultSheet.objects.filter(state="released").update(state="draft")` — from a
+psql session, an import, or a bulk fix — touches no transition row and so meets
+no constraint, and the sheet silently reverts with the audit showing nothing at
+all. That is worse than an unguarded revert, because the log now reads as though
+the result is still released.
+
+A released result is one a parent is holding; correcting it is a *revision*,
+which makes a new version and leaves this one standing, and that is built
+separately. Neither guard is in a revision's way: a revision never moves this
+version out of `released`.
 
 ## Cycles, and why the log carries one
 
@@ -123,6 +137,11 @@ class ResultSheet(models.Model):
         "academics.Term", related_name="result_sheets", on_delete=models.PROTECT
     )
 
+    #: Where the results have got to. Guarded in the database by the trigger in
+    #: migration 0003, which refuses any UPDATE moving this off `released` — the
+    #: log's `nothing_moves_out_of_released` guards the audit, and this guards
+    #: the fact the audit is about. See the module docstring for why the log
+    #: constraint alone left a released sheet revertible with no trace.
     state = models.CharField(
         max_length=16, choices=SheetState, default=SheetState.DRAFT
     )
@@ -200,10 +219,18 @@ class ResultSheetTransition(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ["sheet", "created_at", "pk"]
-        indexes = [
-            models.Index(fields=["sheet", "cycle"]),
-        ]
+        # `sheet_id`, not `sheet`. Ordering by the *relation* makes Django sort
+        # by `ResultSheet.Meta.ordering`, which itself sorts by two more
+        # relations — so `history()` and the same-signatory lookup both compiled
+        # to a four-table join sorted by the term's session and the class's
+        # level. Neither query wants that, and one of them runs inside the row
+        # lock, where every joined table lengthens the hold.
+        #
+        # It also made `history()`'s "oldest first" true only by accident: the
+        # leading sort keys were the term and class, constant only because the
+        # query happens to be single-sheet. On local columns it is true because
+        # it is what the ordering says.
+        ordering = ["sheet_id", "created_at", "pk"]
         constraints = [
             # **Release is terminal**, as a rule Postgres holds. Task 8's
             # revision does not violate this: a revision makes a new version
@@ -232,11 +259,26 @@ class ResultSheetTransition(models.Model):
                 fields=["sheet", "cycle", "to_state"],
                 name="one_transition_to_each_state_per_cycle",
             ),
+            # There is deliberately no `Meta.indexes` entry for
+            # `(sheet, cycle)`. The two unique constraints above already build
+            # btrees led by exactly those columns, so an explicit one answers no
+            # query they cannot — it is a third index per tenant schema, one per
+            # school on the platform, maintained on every insert for nothing.
             # A send-back must say why. Enforced here rather than in a form,
             # because the import and the shell session that skip the service
             # are exactly the callers most likely to leave it blank.
+            #
+            # The test is "contains a non-whitespace character", not "is not the
+            # empty string". `send_back()` compares `reason.strip()`, so a
+            # reason of three spaces is refused by the service and — under the
+            # first spelling of this constraint, `~Q(reason="")` — accepted by
+            # the database. That is the worst of the two: the gap is exactly the
+            # caller the constraint exists for, and what reaches the teacher is
+            # a send-back whose reason renders blank, which is the failure the
+            # rule was written to prevent. The two layers now refuse the same
+            # inputs.
             models.CheckConstraint(
-                condition=~Q(to_state=SheetState.DRAFT) | ~Q(reason=""),
+                condition=~Q(to_state=SheetState.DRAFT) | Q(reason__regex=r"\S"),
                 name="a_send_back_says_why",
             ),
         ]

@@ -110,16 +110,22 @@ class EveryRoleGetsALoginTests(TestCase):
         self.assertNotIn(Role.VICE_PRINCIPAL_ACADEMIC, FAMILY_ROLES)
         self.assertTrue(is_staff_role(Role.VICE_PRINCIPAL_ACADEMIC))
 
-    def test_the_vice_principals_stored_value_fits_the_column(self):
-        """`Membership.role` is `max_length=16`, and the member name is 23.
+    def test_every_roles_stored_value_fits_the_column(self):
+        """`Membership.role` is `max_length=16`, and nothing checks that at import.
 
-        Nothing would refuse the longer value at import time — it would be
+        A value too long is not refused when the enum is defined — it is
         truncated or rejected at the first write, per school, in production.
+        `VICE_PRINCIPAL_ACADEMIC` is why this exists (the member name is 23
+        characters, so the stored value is `vp_academic`), but it is asserted
+        over the whole enum rather than that one member. A test naming one
+        member covers the role that already went in and not the next one, which
+        is the shape the sibling test above moved away from when it dropped its
+        hardcoded count.
         """
-        self.assertLessEqual(
-            len(Role.VICE_PRINCIPAL_ACADEMIC.value),
-            Membership._meta.get_field("role").max_length,
-        )
+        max_length = Membership._meta.get_field("role").max_length
+        for role in Role:
+            with self.subTest(role=role.name):
+                self.assertLessEqual(len(role.value), max_length)
 
     def test_no_role_confers_platform_staff(self):
         principal = make_user("head", "Head Teacher")

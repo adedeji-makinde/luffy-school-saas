@@ -101,9 +101,11 @@ class ChainSetUp(TestCase):
         connection.set_schema_to_public()
         super().tearDown()
 
-    def sheet(self):
+    def sheet(self, actor=None):
         return services.open_sheet(
-            ClassGroup.objects.get(pk=self.jss1a_id), Term.objects.get(pk=self.term_id)
+            ClassGroup.objects.get(pk=self.jss1a_id),
+            Term.objects.get(pk=self.term_id),
+            actor or self.teacher,
         )
 
     def walk_to(self, state):
@@ -195,14 +197,109 @@ class TheForwardPathTests(ChainSetUp):
             [t.actor_id for t in last_two], [self.principal.pk, self.principal.pk]
         )
 
-    def test_an_administrator_may_release_instead(self):
+    def test_an_administrator_may_not_release(self):
+        """Release is the principal's act, and task 8 rests on that.
+
+        This asserted the opposite — an administrator releasing — on the
+        argument that release is often gated on something clerical rather than
+        being a second academic judgement. That is true of schools and was
+        still the wrong call here: the settled rule for this phase makes
+        revision principal-only *because* release is the principal's act, so
+        widening release would have left the next task's authority resting on a
+        premise this module no longer honoured.
+        """
         with connected_to(self.stmarys):
             sheet = self.walk_to(SheetState.APPROVED)
-            services.release(sheet, self.registrar)
+
+            with self.assertRaises(services.NotAllowedToActOnResults):
+                services.release(sheet, self.registrar)
 
             self.assertEqual(
-                ResultSheet.objects.get(pk=sheet.pk).state, SheetState.RELEASED
+                ResultSheet.objects.get(pk=sheet.pk).state, SheetState.APPROVED
             )
+
+    def test_a_refusal_names_roles_the_way_a_person_reads_them(self):
+        """"Principal", not "vp_academic".
+
+        The stored value is an internal key — `vp_academic` was truncated to fit
+        `Membership.role`'s sixteen characters precisely because nobody was
+        meant to read it — and the refusal was joining the raw keys.
+        """
+        with connected_to(self.stmarys):
+            sheet = self.walk_to(SheetState.SUBMITTED)
+
+            with self.assertRaises(services.NotAllowedToActOnResults) as caught:
+                services.check(sheet, self.registrar)
+
+            message = str(caught.exception)
+            self.assertIn(Role.VICE_PRINCIPAL_ACADEMIC.label, message)
+            self.assertNotIn(Role.VICE_PRINCIPAL_ACADEMIC.value, message)
+
+
+class OpeningASheetTests(ChainSetUp):
+    """`open_sheet()` is a writer, so it asks who is calling like the rest.
+
+    It did not, and the module docstring is what makes that a defect rather
+    than a gap: it argues the `_as()` split other service modules use is absent
+    here because there are no actor-less primitives. `open_sheet()` was exactly
+    that primitive — exported, writing a tenant table, never once resolving the
+    school on the connection. Anything reachable from a future screen could
+    mint `ResultSheet` rows for arbitrary (class, term) pairs, each of which
+    `ResultSheetTransition.sheet`'s `PROTECT` then makes awkward to remove.
+    """
+
+    def _open(self, actor):
+        return services.open_sheet(
+            ClassGroup.objects.get(pk=self.jss1a_id),
+            Term.objects.get(pk=self.term_id),
+            actor,
+        )
+
+    def test_every_role_that_can_act_on_the_chain_can_open_a_sheet(self):
+        """Not narrower than the narrowest step. Opening decides nothing."""
+        for actor in (self.teacher, self.vp, self.principal, self.registrar):
+            with self.subTest(actor=str(actor)):
+                with connected_to(self.stmarys):
+                    self.assertIsNotNone(self._open(actor))
+
+    def test_a_parent_cannot_open_a_sheet(self):
+        parent = User.objects.create_user("ade", PASSWORD, full_name="Ade Parent")
+        grant_membership(parent, self.stmarys, Role.PARENT)
+
+        with connected_to(self.stmarys):
+            with self.assertRaises(services.NotAllowedToActOnResults):
+                self._open(parent)
+
+            self.assertEqual(ResultSheet.objects.count(), 0)
+
+    def test_another_schools_principal_cannot_open_a_sheet_here(self):
+        with connected_to(self.stmarys):
+            with self.assertRaises(services.NotAllowedToActOnResults):
+                self._open(self.their_principal)
+
+            self.assertEqual(ResultSheet.objects.count(), 0)
+
+    def test_results_cannot_be_acted_on_from_the_portal(self):
+        """The public schema is the portal, not a customer.
+
+        `_school_on_this_connection()` had no answer here. A caller that never
+        entered a tenant got `School.DoesNotExist`, which is outside
+        `ResultsError`, so every `except ResultsError` handler missed it and a
+        refusal arrived as a 500. Worse where a `School(schema_name="public")`
+        row exists — this codebase creates one in its own tests — because then
+        the lookup *succeeds* and authority is checked against the portal's
+        memberships rather than any school's.
+        """
+        portal = School(name="Portal", slug="portal", schema_name="public")
+        portal.auto_create_schema = False
+        portal.save()
+        grant_membership(self.principal, portal, Role.PRINCIPAL)
+
+        connection.set_schema_to_public()
+        with self.assertRaises(services.NotAllowedToActOnResults) as caught:
+            services.open_sheet(None, None, self.principal)
+
+        self.assertIn("portal", str(caught.exception))
 
 
 class WhoMayActTests(ChainSetUp):
@@ -315,20 +412,42 @@ class SendingBackTests(ChainSetUp):
             self.assertEqual(sheet.state, SheetState.SUBMITTED)
 
     def test_the_database_refuses_a_reasonless_send_back_too(self):
-        """The service is not the only writer. An import is."""
+        """The service is not the only writer. An import is.
+
+        Both spellings of "no reason", because the two layers have to refuse the
+        same inputs to be worth calling two layers. `send_back()` compares
+        `reason.strip()`, so a reason of three spaces is refused by the service;
+        the constraint's first spelling was `~Q(reason="")`, which accepted it.
+        The gap was exactly the caller the constraint exists for, and what
+        reached the teacher was a send-back whose reason renders blank.
+        """
         with connected_to(self.stmarys):
             sheet = self.walk_to(SheetState.SUBMITTED)
 
-            with self.assertRaises(IntegrityError):
-                with transaction.atomic():
-                    ResultSheetTransition.objects.create(
-                        sheet=sheet,
-                        from_state=SheetState.SUBMITTED,
-                        to_state=SheetState.DRAFT,
-                        cycle=sheet.cycle,
-                        actor_id=self.vp.pk,
-                        reason="",
-                    )
+            for reason in ("", "   ", "\t\n "):
+                with self.subTest(reason=repr(reason)):
+                    with self.assertRaises(IntegrityError):
+                        with transaction.atomic():
+                            ResultSheetTransition.objects.create(
+                                sheet=sheet,
+                                from_state=SheetState.SUBMITTED,
+                                to_state=SheetState.DRAFT,
+                                cycle=sheet.cycle,
+                                actor_id=self.vp.pk,
+                                reason=reason,
+                            )
+
+            # And the rule is not "no send-backs" — a real reason is accepted
+            # by the same constraint. Without this the three above would pass
+            # against a constraint that refused everything.
+            ResultSheetTransition.objects.create(
+                sheet=sheet,
+                from_state=SheetState.SUBMITTED,
+                to_state=SheetState.DRAFT,
+                cycle=sheet.cycle,
+                actor_id=self.vp.pk,
+                reason="Chemistry CA is out of 30.",
+            )
 
     def test_a_send_back_keeps_the_whole_history(self):
         """The reason columns exist for. After a send-back and a resubmit, a
@@ -519,32 +638,77 @@ class TheCycleIsNotTheCallersToSetTests(ChainSetUp):
                     "cycle", inspect.signature(function).parameters
                 )
 
-    def test_the_guard_still_bites_in_a_later_cycle(self):
+    def test_the_same_signatory_guard_still_bites_in_a_later_cycle(self):
         """Scoping per cycle must not have switched the guard off after a
-        send-back — which is exactly what a mis-stamped cycle would look like."""
+        send-back — which is exactly what a mis-stamped cycle would look like.
+
+        **This test used to be unable to fail.** It walked the sheet to
+        `approved` in cycle 1 and then asserted a second `approve()` was
+        refused — but a sheet at `approved` fails the *state* check first, so
+        `_require_not_already_signed` was never reached. Deleting both the guard
+        and its unique constraint left it green, and `OnePersonCannotTakeTwoSteps`
+        covers only cycle 0, so the property the class claims had no coverage
+        anywhere.
+
+        What actually exercises the guard is one person taking **two different
+        advancing steps in the same later cycle** — Kemi, class teacher and
+        acting vice principal, submitting and then checking in cycle 1. The
+        sheet is at `submitted` and `check()` expects `submitted`, so the state
+        check passes and the signature rule is the only thing that can refuse.
+        """
+        # Kemi is the class teacher *and* the acting vice principal, the small
+        # school case `OnePersonCannotTakeTwoStepsTests` is built on.
+        grant_membership(self.teacher, self.stmarys, Role.VICE_PRINCIPAL_ACADEMIC)
+
         with connected_to(self.stmarys):
             sheet = self.sheet()
             services.submit(sheet, self.teacher)
             sheet.refresh_from_db()
-            services.send_back(sheet, self.vp, "Chemistry CA is out of 30.")
+            services.send_back(sheet, self.principal, "Chemistry CA is out of 30.")
+            sheet.refresh_from_db()
+            self.assertEqual(sheet.cycle, 1)
+
+            services.submit(sheet, self.teacher)
+            sheet.refresh_from_db()
+
+            with self.assertRaises(services.AlreadySignedThisCycle) as caught:
+                services.check(sheet, self.teacher)
+
+            # It names the step they took *this* pass, not the one in cycle 0.
+            self.assertEqual(caught.exception.existing.cycle, 1)
+            self.assertEqual(
+                caught.exception.existing.to_state, SheetState.SUBMITTED
+            )
+
+    def test_the_database_holds_the_same_signatory_rule_in_a_later_cycle(self):
+        """The half the service cannot hold, asked in cycle 1 rather than 0.
+
+        `one_signature_per_person_per_review_cycle` is what stands when two
+        concurrent requests both read "they have not signed yet". Its scoping is
+        `(sheet, cycle, actor)`, so a cycle stamped from the wrong place would
+        leave it guarding an empty bucket — and the service-level test above
+        cannot see that, because it never reaches the index.
+        """
+        grant_membership(self.teacher, self.stmarys, Role.VICE_PRINCIPAL_ACADEMIC)
+
+        with connected_to(self.stmarys):
+            sheet = self.sheet()
+            services.submit(sheet, self.teacher)
+            sheet.refresh_from_db()
+            services.send_back(sheet, self.principal, "Chemistry CA is out of 30.")
             sheet.refresh_from_db()
             services.submit(sheet, self.teacher)
             sheet.refresh_from_db()
-            services.check(sheet, self.vp)
-            sheet.refresh_from_db()
-            services.approve(sheet, self.principal)
-            sheet.refresh_from_db()
 
-            # A second approval in cycle 1 must still be refused.
-            with self.assertRaises(services.WrongState):
-                services.approve(sheet, self.principal)
-
-            self.assertEqual(
-                ResultSheetTransition.objects.filter(
-                    sheet=sheet, cycle=1, to_state=SheetState.APPROVED
-                ).count(),
-                1,
-            )
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    ResultSheetTransition.objects.create(
+                        sheet=sheet,
+                        from_state=SheetState.SUBMITTED,
+                        to_state=SheetState.CHECKED,
+                        cycle=1,
+                        actor_id=self.teacher.pk,
+                    )
 
 
 class OnePersonCannotTakeTwoStepsTests(ChainSetUp):
@@ -615,8 +779,12 @@ class ReleaseIsTerminalTests(ChainSetUp):
                 services.release(sheet, self.principal)
 
     def test_the_database_refuses_any_transition_out_of_released(self):
-        """Enforced, not documented. `nothing_moves_out_of_released` is a check
-        constraint, so no `.update()` and no shell session can undo a release."""
+        """`nothing_moves_out_of_released` — the guard on the *log*.
+
+        It stops a reversal being **recorded**. On its own it does not stop one
+        being **performed**; that is the next test, and the two are stated
+        separately because conflating them is what left the gap.
+        """
         with connected_to(self.stmarys):
             sheet = self.walk_to(SheetState.RELEASED)
 
@@ -630,6 +798,52 @@ class ReleaseIsTerminalTests(ChainSetUp):
                         actor_id=self.principal.pk,
                         reason="Undo it.",
                     )
+
+    def test_the_database_refuses_a_bulk_update_moving_a_sheet_out_of_released(self):
+        """The guard on the *sheet*, which was missing entirely.
+
+        `nothing_moves_out_of_released` lives on the transition table, and
+        migration 0002's trigger fires on the transition table. Nothing touched
+        `results_resultsheet`, so this — from a psql session, an import, or a
+        bulk fix — succeeded silently:
+
+            ResultSheet.objects.filter(state="released").update(state="draft")
+
+        No transition row is written, so no constraint is met. The sheet
+        reverted and the audit showed no retraction at all, which is worse than
+        an unguarded revert: the log then reads as though the result is still
+        released while the sheet is a draft somebody can edit.
+        """
+        with connected_to(self.stmarys):
+            sheet = self.walk_to(SheetState.RELEASED)
+
+            for target in (SheetState.DRAFT, SheetState.APPROVED):
+                with self.subTest(target=target):
+                    with self.assertRaises(Exception) as caught:
+                        with transaction.atomic():
+                            ResultSheet.objects.filter(pk=sheet.pk).update(
+                                state=target
+                            )
+                    self.assertIn("released to parents", str(caught.exception))
+
+            sheet.refresh_from_db()
+            self.assertEqual(sheet.state, SheetState.RELEASED)
+
+    def test_a_released_sheet_may_still_be_written_for_anything_but_its_state(self):
+        """The trigger guards the rule, not the row.
+
+        A guard broader than the rule is one somebody eventually turns off
+        wholesale, and task 8's revision has to be able to write this row.
+        """
+        with connected_to(self.stmarys):
+            sheet = self.walk_to(SheetState.RELEASED)
+
+            ResultSheet.objects.filter(pk=sheet.pk).update(
+                state=SheetState.RELEASED, updated_at=sheet.updated_at
+            )
+
+            sheet.refresh_from_db()
+            self.assertEqual(sheet.state, SheetState.RELEASED)
 
 
 class TheLogIsAppendOnlyTests(ChainSetUp):
@@ -692,6 +906,7 @@ class TwoSchoolsTests(ChainSetUp):
             theirs = services.open_sheet(
                 ClassGroup.objects.get(pk=self.their_jss1a_id),
                 Term.objects.get(pk=self.their_term_id),
+                self.their_principal,
             )
             self.assertEqual(theirs.state, SheetState.DRAFT)
 

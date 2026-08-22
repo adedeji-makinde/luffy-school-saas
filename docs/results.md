@@ -44,21 +44,47 @@ Postgres trigger refuses, which is the error a `psql` session, a data import or
 a bulk `.update()` runs into — none of which go near the model's methods. Tests
 cover both paths, including `.update()`, which never calls `save()`.
 
-## Release is terminal, as a constraint
+## Release is terminal — and it takes two guards, not one
 
-`nothing_moves_out_of_released` is a `CheckConstraint` refusing any row whose
-`from_state` is `released`. Not a docstring, not a service-layer `if` — one
-`.update()` would disagree with either.
+`nothing_moves_out_of_released` is a `CheckConstraint` refusing any transition
+row whose `from_state` is `released`. That was the whole of it, and the whole of
+it was not enough. **It guards the log, not the fact the log is about.**
+
+The gap, found in review:
+
+```python
+ResultSheet.objects.filter(state="released").update(state="draft")
+```
+
+writes no transition row, so it meets no constraint on the transition table —
+and migration 0002's append-only trigger also fires only on the transition
+table. Nothing in the schema touched `results_resultsheet` at all. From a psql
+session, an import or a bulk fix, a released sheet reverted silently. That is
+worse than an unguarded revert: the audit then reads as though the result is
+still released, while the sheet is a draft somebody can edit.
+
+So there is a second guard, in migration 0003 — a trigger on
+`results_resultsheet` refusing any UPDATE that moves `state` off `released`. A
+check constraint cannot express it, because the rule is about the move from one
+row-version to the next and a CHECK sees only the row in front of it.
+
+Deliberately narrow: **BEFORE UPDATE, and only on a change of `state`.** Not
+DELETE — a released sheet always has transitions and `ResultSheetTransition.sheet`
+is `PROTECT`, so the row cannot be deleted while its own audit points at it. Not
+on every UPDATE either, because `updated_at` and the fields task 8 will add have
+to stay writable, and a guard broader than its rule is one somebody eventually
+turns off wholesale.
 
 A released result is one a parent is holding. Correcting it is a **revision**,
 which makes a new version and leaves this one standing; that is built separately
-and does not violate this constraint, because a revision never moves this
-version out of `released`.
+and neither guard is in its way, because a revision never moves this version out
+of `released`.
 
 This is why `ResultSheetTransition` stores `from_state` even though the previous
-row's `to_state` implies it. The redundancy is what lets the rule be a check
-constraint on a single row rather than something that has to walk the log — and
-a constraint needing no context is one no future query can get wrong.
+row's `to_state` implies it. The redundancy is what lets the log's half of the
+rule be a check constraint on a single row rather than something that has to
+walk the log — and a constraint needing no context is one no future query can
+get wrong.
 
 ## Sending back
 
@@ -71,6 +97,15 @@ to `draft`, taken by whoever could have said yes instead. It **requires a
 reason** — refused by the service *and* by `a_send_back_says_why`, because a
 refusal that does not say what is wrong sends a teacher back to forty-five
 scores with no idea which one to look at.
+
+The two layers have to refuse the *same inputs* to be worth calling two layers,
+and at first they did not. `send_back()` compares `reason.strip()`; the
+constraint was `~Q(reason="")`, which accepts three spaces. The gap was exactly
+the caller the constraint exists for — the import, the psql session — and what
+came out the other side was a send-back whose reason renders blank on a
+teacher's screen, which is the failure the rule was written to prevent. It now
+tests for a non-whitespace character, and the test tries `""`, `"   "` and
+`"\t\n "` rather than only the first.
 
 ## Cycles and the same-signatory rule
 
@@ -128,6 +163,31 @@ line to `cycle=sheet.cycle` and re-running gives:
 visible symptom is a crash; the invisible one, had the collision not existed,
 would have been a second approval at the wrong cycle that no guard fires on.
 
+### A test that could not fail
+
+`test_the_guard_still_bites_in_a_later_cycle` was written to prove the
+same-signatory rule survives a send-back — the thing `cycle` exists for. It
+walked the sheet to `approved` in cycle 1 and asserted a second `approve()` was
+refused.
+
+It was refused, but not by the guard. A sheet at `approved` fails the **state**
+check first, several lines before `_require_not_already_signed()` is reached. So
+the test passed with the guard deleted *and* with the unique constraint dropped,
+and `OnePersonCannotTakeTwoSteps` only ever covers cycle 0 — meaning the
+property the test was named for had no coverage anywhere in the suite.
+
+What actually exercises it is one person taking **two different advancing steps
+in the same later cycle**: Kemi, class teacher and acting vice principal,
+submitting and then checking after a send-back. The sheet is at `submitted` and
+`check()` expects `submitted`, so the state check passes and the signature rule
+is the only thing that can refuse. There is a second test for the database half,
+inserting the row directly, because the service-level one never reaches the
+index.
+
+The general shape is worth naming: **a test whose assertion is satisfied by an
+earlier guard than the one it is named for.** Nothing about it looks wrong — it
+is green, it is specific, and it mentions the right rule in its docstring.
+
 ## What the lock actually buys
 
 `approve()` is read-modify-write on one row, and every transition takes
@@ -146,22 +206,82 @@ screen, saying nothing — into a `WrongState` naming the state the sheet reache
 Two layers doing two different jobs, and it would have been easy to write the
 lock's docstring claiming the constraint's job.
 
+### What the lock does *not* reach, and a claim that did not survive checking
+
+A joined `SELECT ... FOR UPDATE` locks a row in **every** joined table, so an
+ordering that walks a foreign key silently locks rows the statement never
+writes. `ResultSheet.Meta.ordering` is `["term", "class_group"]` — two
+relations — so this looked like a live bug: every transition holding the term
+row, two principals approving two different classes in one term serialised on
+something neither writes.
+
+It is not, and the reason is worth recording because it is a fact about Django
+that the obvious mental model gets wrong:
+
+> **`QuerySet.get()` clears ordering itself.** Django 5.2 runs
+> `clone = clone.order_by()` inside `get()` before compiling. `QuerySet.filter()`
+> does not.
+
+The SQL the tests actually capture is `FROM results_resultsheet WHERE id = %s
+LIMIT 21 FOR UPDATE` — no join — with or without the `.order_by()` in
+`_locked()`. Compiling `.filter(pk=...)` by hand shows the join and is what
+makes the bug look real; it is a different code path.
+
+The `.order_by()` stays anyway, and `LockScopeTests` stays with it, because the
+property is one line from being lost. Rewriting `_locked()` as
+`.filter(pk=...).first()` — a change nobody would describe as touching locking —
+brings the join straight back, and both tests fail: one on the SQL, one on real
+contention (`could not obtain lock on row in relation "academics_term"`). The
+tests pin the property; the call is belt to Django's braces.
+
 ## Who may take which step
 
 | Step | Roles |
 | --- | --- |
+| open a sheet | anyone who can take a step below |
 | submit | teacher, admin |
 | check | vice principal (academic) |
 | approve | principal |
-| release | principal, admin |
+| release | principal |
 | send back | vice principal (academic), principal |
 
 An **administrator may submit** because entering and submitting a paper sheet is
 office work in most schools — the reasoning `gradebook.MARK_ENTERING_ROLES`
 gives for admitting one. An administrator **may not check**: that is the step the
 chain exists for, and widening it would let the office both submit and check.
-An administrator **may release** because release is commonly gated on something
-clerical — fees settled, cards printed — and is not a second academic judgement.
+
+**Release was `{principal, admin}` and is now the principal's alone.** The
+argument for the admin was a real one — release is commonly gated on something
+clerical, fees settled and cards printed, rather than being a second academic
+judgement. It was still wrong here, because it contradicted a decision already
+taken for this phase, and the contradiction was load-bearing: task 8 makes
+revision principal-only *on the stated grounds that release is the principal's
+act*. Widening release would have left the next task's authority rule resting on
+a premise this module had quietly stopped honouring. Narrowed rather than left
+because the two resolutions are not symmetrical — narrowing costs a school an
+inconvenience a later PR can undo, widening publishes forty-five children's
+results on an authority nobody granted.
+
+**Opening a sheet** is a write and therefore asks who is calling, which it did
+not at first. `open_sheet()` was an actor-less primitive in a module whose
+docstring argues there are none — exported, writing a tenant table, never
+resolving the school on the connection. Its roles are the union of everyone who
+can take a step: opening decides nothing, so it should not be narrower than the
+narrowest step, and it should not admit anybody who cannot act on the row they
+have just created.
+
+Authority is asked at the school on the connection, and **the portal is refused
+outright**. `_school_on_this_connection()` had no answer for the public schema:
+a caller that never entered a tenant got `School.DoesNotExist`, which is outside
+`ResultsError`, so a refusal arrived as a 500 — and where a
+`School(schema_name="public")` row exists, as this codebase's own tests create,
+the lookup *succeeded* and authority was checked against the portal's
+memberships instead. `schools.logging.current_school()` had the rule already:
+the public schema is the portal, not a customer.
+
+Refusals name roles by **label**, not by stored value. `vp_academic` was
+truncated to fit `Membership.role`'s sixteen characters precisely because nobody
+was meant to read it, and the refusal was joining the raw keys.
 
 Authority is asked at the school on the connection, never at a school passed in
 as an argument, for the reason `accounts.students.why_not_a_student_here()` reads
@@ -206,11 +326,18 @@ The method both times: break one thing deliberately, re-run, read the failure.
 | --- | --- | --- |
 | `select_for_update()` removed | `one_transition_to_each_state_per_cycle` fires; the audit still holds one approval | The **constraint** prevents the double approval. The **lock** only converts the loser's 500 into a `WrongState`. The lock's docstring had been claiming the constraint's work. |
 | `cycle=locked.cycle` → `cycle=sheet.cycle` | `one_signature_per_person_per_review_cycle` fires on a resubmission | `cycle` really is load-bearing, and taking it from the locked row is what keeps it correct. |
+| `.order_by()` removed from `_locked()` | **Nothing. Both lock-scope tests still pass.** | The joined-lock bug was never present: `QuerySet.get()` clears ordering itself. A finding that reads as obviously true can still be false, and the way to tell is to break it and look. |
+| `_locked()` → `.filter(pk=...).first()` | `JOIN` in the locking SQL; `could not obtain lock on row in relation "academics_term"` | The same tests *do* bite on a real regression. They pin the property rather than the spelling, which is why they are kept even though the bug they were written for did not exist. |
+| trigger moved from `BEFORE UPDATE` to `BEFORE DELETE` | `.update(state="draft")` on a released sheet succeeds; the sheet ends up `draft` with an audit that still says released | The sheet-level guard is doing real work, and the log constraint alone never held the rule. |
+| `a_send_back_says_why` reverted to `~Q(reason="")` | a reason of `"   "` is accepted by the database and refused by the service | Two layers that refuse different inputs are one layer and a gap. |
+| `_require_not_already_signed` neutered | the cycle-1 same-signatory test errors | The rewritten test reaches the guard. Its predecessor stayed green through the same break. |
 
-The first is the one worth remembering. It would have been entirely natural to
-write "the lock prevents two approvals", ship it, and have a true-sounding
-sentence in the codebase that no longer described the code the day somebody
-removed the constraint as redundant.
+The first two are the ones worth remembering for what they say about the code.
+The third is worth remembering for what it says about **review**: it would have
+been entirely natural to accept a well-argued finding, "fix" it, write the fix
+up as a bug caught, and ship a docstring describing a bug the code never had.
+The habit that caught it is the same one the first two come from — break the
+thing you are about to take credit for, re-run, and read what happens.
 
 ## A test-isolation trap this app walked into
 
@@ -231,6 +358,21 @@ for us; the schema is the part that has to be told to go.
 
 Plain `TestCase` needs none of this — its rollback covers tenant tables too,
 because they are in the same transaction.
+
+**The other four `TransactionTestCase` classes do not have this problem**, and
+the reason is worth writing down because it looks like an omission. Review
+flagged them as leaking the same schemas; they do not. Every one of them builds
+its schools through a helper that sets `auto_create_schema = False` —
+`accounts/tests/test_transfer_concurrency.py`, `schools/tests/test_invitations.py`'s
+`make_school()` used by both invitation-concurrency classes, and the
+`School(schema_name="public")` portal rows in `test_invitation_api.py`, which
+need no schema of their own. `test_signin_concurrency.py` creates no school at
+all. No schema is created, so there is nothing to leak.
+
+What *is* real is that the teardown is copied by hand into the two files that
+do create schemas, and nothing structural stops the next one being written
+without it. That is [issue #20](https://github.com/adedejimakinde/luffy-school-saas/issues/20),
+not something this branch fixes.
 
 ## Not built here
 
