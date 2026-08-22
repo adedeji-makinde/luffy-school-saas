@@ -47,6 +47,7 @@ from accounts import signin
 from accounts.services import NotPermitted
 from accounts.session import SESSION_EXPIRED, session_auth, why_unauthenticated
 from gradebook.api import MessageOut, router as gradebook_router
+from results.api import router as results_router
 from schools import invitations as invitation_service
 from schools.delivery import DeliveryFailed, DeliveryNotConfigured, NoDeliveryAddress
 from schools.models import (
@@ -62,6 +63,9 @@ from schools.models import (
 api = NinjaAPI(title="Luffy School API", version="1.0.0")
 
 api.add_router("/gradebook/", gradebook_router, tags=["gradebook"])
+# Tenant-scoped like the gradebook, so no `{slug}` in its paths either — the
+# schema is already chosen from the hostname before any of it runs.
+api.add_router("/results/", results_router, tags=["results"])
 
 
 @api.exception_handler(AuthenticationError)
