@@ -21,6 +21,11 @@ services:
       # real one; it makes the link deterministic and inspectable in the console
       # backend's output without pretending to resolve.
       INVITATION_ACCEPT_URL: http://localhost:3000/invitations/{token}/
+      # Also development only, and explicit for the same reason. settings.py
+      # defaults DEBUG to off and refuses to start without a real
+      # DJANGO_SECRET_KEY, so a deploy that sets neither fails loudly instead
+      # of serving tracebacks signed with a key that is public in this repo.
+      DJANGO_DEBUG: "1"
     depends_on:
       - db
     

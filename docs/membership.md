@@ -300,6 +300,171 @@ indexes don't collide. Students get a school-issued handle (`STM/2026/0042`) bec
 many have no email address; parents commonly use the phone number the school has on
 file.
 
+`POST /api/login/` is the door — one `identifier` field, not three, because asking
+somebody to first classify what they are about to type is asking them to know something
+about our schema. It answers with the person's name, the schools this login may act at
+**and the host each one lives on**, and a CSRF token. The host is not decoration: sign-in
+happens on the portal and the work happens on a school's own host, so a client told only
+"St Mary's" still cannot get a teacher back to their marking sheet.
+
+`POST /api/logout/` is authenticated on purpose, which is what puts it behind ninja's CSRF
+check. An unauthenticated logout is a route any other origin can aim at a signed-in
+teacher's browser to throw away the session they are marking with.
+
+**`/api/login/` is CSRF-checked too, by hand.** ninja exempts its own views from Django's
+CSRF middleware and does the check inside cookie authentication instead — which the one
+route you use *before* you have a cookie does not have. So the view calls `check_csrf()`
+itself, and `GET /api/csrf/` exists to give a client with no template somewhere to get a
+token. The attack this closes runs the opposite way to the usual one: the attacker does
+not steal a session, they give the victim one of *theirs*, and a teacher whose browser is
+quietly signed in as somebody else marks a class of thirty into an account the attacker
+reads at leisure. `SameSite` does not help, because the forged request needs no cookie of
+ours to succeed — it sets one. The cost is one round trip before a client's first sign-in,
+which is exactly what Django's own `LoginView` has always required.
+
+**The admin is a sign-in door as well, and it is held to the same policy.** Django's admin
+authenticates through `AuthenticationForm`, which never passes near `accounts/signin.py` —
+so for as long as both existed, `/admin/login/` took unlimited guesses and recorded
+nothing, against the `is_platform_staff` accounts that are the only ones able to reach
+every school's data at once. `accounts/forms.py` now runs the same three throttle calls
+the endpoint does, sharing one window per identifier rather than keeping a second count
+that would make the limit quietly twice what it says.
+
+It is also served **on the portal only** now, by routing rather than by a check inside a
+view: `PUBLIC_SCHEMA_URLCONF` carries the admin and `ROOT_URLCONF` does not, so a school's
+host has no such route. Serving it from a tenant host was worse than untidy — the admin
+edits *shared* tables, so it meant privileged writes to platform-wide rows issued on a
+connection whose `search_path` had been set to one school's schema.
+
+**Sign-in is served on the portal host and nowhere else.** A school's host refuses anyone
+without an active membership *there* (`SchoolAccessMiddleware`); the portal is the one
+host where somebody with no membership anywhere is still let through the door, and where
+a parent with children at three schools sees all of them. Serving sign-in from a school's
+host would mean the same credentials worked on one hostname and not another, and that a
+teacher who is also a parent elsewhere needed two sessions to see their own child. A
+school host answers `/api/login/` with a **404** — the route does not exist here — matching
+the gradebook's answer on the portal.
+
+**A session belongs to the person, not to one school.** That is not a new decision; it is
+the one this project has been relying on since `Membership` was made shared rather than
+per-tenant, and `SchoolAccessMiddleware` re-derives what somebody may do from the host on
+every request rather than from anything stored in the session. Writing the school into the
+session would put the same fact in two places and make the session's copy the stale one
+the moment a membership is suspended.
+
+What that costs is `SESSION_COOKIE_DOMAIN`. A cookie set with no `Domain` goes back only
+to the host that set it, so without a domain spanning the portal and every school, a
+teacher signs in successfully on the portal and arrives at their own school's host as a
+stranger — and every part of that looks like it worked. Left unset it is not merely
+unconfigured, it is wrong in a way that only shows up on the second host, so
+`accounts.checks.session_cookie_spans_every_host()` refuses a production deploy without it
+rather than letting a teacher discover it. Unset is still right for single-host local
+development.
+
+### Guessing, and what happens to people who guess
+
+**One refusal, whatever went wrong.** No account, wrong password, deactivated account, two
+accounts matching one identifier: same status, same code, same sentence. Splitting them is
+the standing temptation on a sign-in route and it is how a login endpoint becomes an
+account-existence oracle — every email and phone number on the platform, one guess at a
+time, no credential needed. `IdentifierBackend` already charges a missing account the same
+password hash as a real one, so the four do not differ in timing either.
+
+**Counted, not locked.** Ten failures per identifier and fifty per address, per
+quarter-hour; reaching either closes the window for a few minutes and never disables
+anything. A lockout looks like the stronger control and is in fact a weapon: identifiers
+here are semi-public *by design* — a school publishes staff addresses, a parent's number is
+on the enrolment form, a student's handle is printed on their report card — so anyone who
+can read a school's website could hold a teacher out of the gradebook for as long as they
+kept typing. Against the ten-character password floor a few guesses per quarter-hour buys
+an attacker nothing, and costs a teacher who has forgotten their password a short wait
+rather than a call to an administrator who may not be in the building.
+
+**Failures, not attempts**, which is what lets the per-address limit survive contact with a
+school: a staff room reaches the internet through one NAT address, and counting every
+sign-in would refuse the fortieth teacher to arrive at 07:50 for being the fortieth. A
+success clears the identifier's count and deliberately **not** the address's — clearing
+the address on success would hand an attacker a reset button in the form of their own
+account.
+
+**The throttle is asked before the credentials**, so a closed window is closed to
+everybody, including a caller whose next guess happens to be right. It counts against the
+identifier *as typed*, whether or not it resolves to anybody — counted only for accounts
+that exist, the 429 would be the oracle the 401 refuses to be.
+
+Kept in Postgres rather than the cache, and the reason is worth repeating because it is
+invisible: there is no `CACHES` entry in this project, so Django's default is `LocMemCache`
+— per process. A cache-backed throttle would count separately in each worker, turning a
+limit of ten into ten times however many processes are running, with the setting reading
+correctly and the tests passing on a single process. What is stored is a **digest** of the
+identifier, not the identifier: people type their password into that box, and a table of
+those in plain text is a credential store nobody decided to build. The address is stored
+in the clear, because it is not a credential and it is the one field an incident is
+actually investigated from.
+
+`X-Forwarded-For` is ignored unless `TRUSTED_PROXY_COUNT` says how many hops our own edge
+wrote. Believing it by default would let any caller invent an address per guess and opt
+out of the per-address limit entirely.
+
+## Staying signed in, and being told when you are not
+
+The case that decides session policy is a teacher marking a class of thirty. Each cell
+saves as it loses focus, so a marking session is a long stretch of small writes, not one
+form and one submit. Two Django defaults are wrong for that shape, and both are overridden
+in `settings.py` with the reasoning kept beside them.
+
+**The window is idle time, not total time.** Django's default
+(`SESSION_SAVE_EVERY_REQUEST = False`) runs the clock from the moment of *login* and never
+extends it, however hard the person is working. A teacher who signed in near the end of
+the window is logged out mid-sheet with the cursor still in a cell, seconds after saving a
+mark successfully. `SESSION_SAVE_EVERY_REQUEST = True` slides the expiry on every request,
+so "expired" means "went away" — the only thing anybody expects it to mean. The cost is
+one session write per request, which for a register is thirty rather than none; accepted,
+and if it ever shows in database load the answer is a cached session backend, not turning
+it back off.
+
+`SESSION_COOKIE_AGE` is twelve hours, down from Django's two weeks. A school day with room
+either side, so a normal working day never trips it and a session left open on a shared
+staff-room computer is gone by morning. Two weeks of *idle* time was never a decision; it
+was the default nobody had chosen.
+
+**A 401 says which 401 it is.** ninja's stock answer is `{"detail": "Unauthorized"}`
+whether the caller never signed in or signed in and has since been timed out. Those are
+the same status code and completely different situations: the second means *your work is
+still good, sign in again and send it*, and a client that cannot tell them apart has to
+treat every 401 as fatal and discard whatever the teacher had typed.
+`accounts.session.SchoolSessionAuth` stamps which case it is — a session cookie was
+presented, or none was — and the handler in `api.py` turns that into `code`
+(`session_expired` / `not_authenticated`), `detail` for a person, and `retryable`.
+
+`retryable` rests on a premise worth stating: authentication runs *before* the view, so a
+request answered with 401 did not happen. Sending it again after signing in applies it
+once, not twice, on every endpoint rather than only the idempotent ones. It is a narrower
+claim than "safe to repeat in general" — a write whose *response* was lost is a different
+situation and is covered by the gradebook's version check, not by this flag.
+
+Splitting one 401 into two is the kind of change that quietly becomes a disclosure, so:
+this one is not a session-key oracle. A forged or random cookie is unusable for exactly
+the same reason an expired one is and gets exactly the same answer. Nothing reports
+whether the key was ever real — unlike the invitation routes, which must answer a bad
+token with a flat 404 because there *is* something on the other side to leak.
+
+**What the server deliberately does not do is hold the teacher's unsent marks.** Writing
+them would need the authority that just lapsed, and a server-side draft store is a second
+copy of the gradebook with none of its rules. Replaying is the client's job, and the
+server's half of the bargain is that replaying is *safe*: every write is conditional on
+the version the teacher was shown, and a repeat of the caller's own write is recognised
+rather than counted twice. `gradebook/tests/test_session_expiry.py` holds that across a
+re-login, which is the one place it could quietly stop being true — the retry is the same
+person on a different session.
+
+> The recovery this describes is only completable because there is now somewhere to sign
+> back in: see [Signing in](#signing-in). Note the one case that is deliberately *not*
+> `session_expired` — signing out on purpose deletes the cookie as well as the session, so
+> the next request presents nothing and is told `not_authenticated`. Telling somebody who
+> chose to sign out that their work "can be sent again" would invite a client to replay
+> what they had just abandoned.
+
 ## Identifiers: one phone number, one account
 
 Before this, `phone` was stored as whatever string was typed. `08031234567`
@@ -408,6 +573,31 @@ What remains open is the other half of the audience: parents and students. That 
 the same flow with a different role value. Parents commonly share one phone between two
 guardians, students often have neither email nor phone, and both need a channel that is
 not email — which is why delivery is a seam rather than a method (see below).
+
+**3. ~~There is no login endpoint.~~ Built.** `POST /api/login/` and `POST /api/logout/`,
+on the portal host only. See [Signing in](#signing-in) — this item held the decisions
+rather than the code, and all three have been made:
+
+*Where sign-in happens:* the portal host, because a school's host is defined by refusing
+anybody without an active membership there, and that is the wrong door for a parent whose
+children are at two schools.
+
+*Whether a session is scoped to one school:* it is not, and that was never really open —
+`Membership` is shared and `SchoolAccessMiddleware` re-derives access per request from the
+host, so the session has never held a school and should not start. The work was the
+consequence: `SESSION_COOKIE_DOMAIN`, and a deploy check that refuses to let it go unset.
+
+*Rate limiting and lockout:* throttled, never locked, in Postgres rather than the cache —
+with the reasoning for each in [Guessing, and what happens to people who
+guess](#guessing-and-what-happens-to-people-who-guess). The short version is that a
+lockout on a semi-public identifier is a weapon rather than a defence, and that a
+cache-backed throttle in a project with no `CACHES` entry would silently be per-worker.
+
+Still open, and now the only thing between a browser and this API: **there is no password
+reset.** A teacher who forgets theirs has no self-service path, and the invitation flow
+only sets a *first* password. It is the same shape as the invitation flow — a one-time
+token delivered over a channel — and should probably reuse `schools/delivery.py` rather
+than grow a second mechanism beside it.
 
 ## Inviting staff
 

@@ -384,6 +384,36 @@ Note what this does *not* forbid: **tenant → tenant** foreign keys are fine an
 tables live in the same schema, so none of the above applies — and `PROTECT`
 there really does protect, which a test pins.
 
+#### Second model under the policy: `gradebook.Score`
+
+`gradebook.Score` is the second tenant-scoped model to need a student, and it
+carries `student_membership_id`, `recorded_by_id` and `updated_by_id` as bare ids
+on the reasoning above. **This is not ratification.** The policy is still
+proposed; a second model following it is evidence that it is livable, not a
+second reader agreeing with it, and the status line above stands until somebody
+argues the other side.
+
+What the second application did add is a limit on the compensation. Above,
+`FeeLedgerEntry` pays part of the cost back by **freezing the identity it needs**
+— and that reads as though freezing is what a bare id asks of every table. It is
+not. `Score` deliberately stores no student name at all: a receipt has to keep
+saying what it said, whereas a marking sheet is a live working document, and a
+teacher who corrects the spelling of a child's name wants the corrected spelling
+on the sheet they are typing into now. So the roll is read live from
+`school_directory()` and only the mark is stored.
+
+The two are answering different questions, and the general rule is the narrower
+one: **a bare id costs you the join, and each table decides for itself whether to
+buy it back.** Freeze when the row is a historical claim; read live when it is a
+working record. What is *not* optional is checking the id — both apps refuse a
+membership that is not a `STUDENT` one, and one whose school is not the schema
+being written.
+
+The cost `Score` accepts by not freezing: a mark on its own does not say whose it
+is once the membership is gone. Acceptable while a mark is only ever read through
+a sheet, and the thing to revisit if marks have to outlive the roll. See
+[gradebook.md](gradebook.md).
+
 ### Half of option 3 now exists
 
 `accounts/deletion.py` is the deletion path that iterates every schema. **This
